@@ -82,6 +82,7 @@ void SaveProjectConfig();
 void LoadProjectConfig();
 void CheckForRecoveryAutosave();
 void GenerateTerrainRelief();
+void OpenKeybindHelp();
 
 // Persisted world data lives together; aliases keep the editing code concise while
 // making the ownership boundary explicit for save/load operations.
@@ -754,6 +755,41 @@ void OpenConfirmation(ConfirmAction action, const std::string &title,
     gInfoTitle = title;
     gInfoLines = std::move(lines);
     OpenModal(ModalType::Confirm, {});
+}
+
+void OpenKeybindHelp() {
+    gInfoTitle = "KEYBOARD & MOUSE HELP";
+    gInfoLines = {
+        "NAVIGATION",
+        "WASD / ARROWS     PAN THE CAMERA",
+        "MIDDLE DRAG       PAN QUICKLY ACROSS THE MAP",
+        "MOUSE WHEEL       ZOOM AROUND THE CURSOR",
+        "HOME              FIT ALL MAP CONTENT",
+        "R                 RESET CAMERA AND ZOOM",
+        "PAINTING",
+        "LEFT CLICK/DRAG   USE THE ACTIVE TOOL",
+        "RIGHT CLICK/DRAG  ERASE OR FINISH A PATH",
+        "SHIFT + DRAG      FILL OR ERASE A RECTANGLE",
+        "[ / ]             DECREASE / INCREASE BRUSH SIZE",
+        "H                 TOGGLE ROUND / BLOCK BRUSH",
+        "T                 CYCLE TERRAIN / REGION / HEIGHT / FOG",
+        "Q / E             LOWER / RAISE ELEVATION VALUE",
+        "TOOLS",
+        "F1 BRUSH   F2 FLOOD FILL   F3 LINE   F4 CURVE",
+        "F5 POLYGON   F6 CIRCLE   F7 SCATTER",
+        "F8 RIVER   F9 TRADE ROUTE   F10 SELECTION",
+        "F11 PLAYER VIEW   F12 MEASURE",
+        "WORLD AND PROJECT",
+        "M CITY   K POI   N NEW REGION   TAB CYCLE REGION",
+        "V REGIONS   L LABELS   G GRID   Y HEX / SQUARE",
+        "CTRL+F FIND   CTRL+E ENCOUNTER   I WORLD INFO",
+        "DELETE MARKER/SELECTION   X DELETE ROUTE",
+        "CTRL+C/X/V COPY / CUT / PASTE SELECTION",
+        "CTRL+Z/Y UNDO / REDO   C CLEAR ACTIVE LAYER",
+        "CTRL+S/L SAVE / LOAD   P EXPORT   ESC CLOSE / QUIT",
+        "PRESS ? OR USE THE HELP BUTTON TO OPEN THIS MENU",
+    };
+    OpenModal(ModalType::Info, {});
 }
 
 // Opens an in-window naming dialog for the pending River/TradeRoute path.
@@ -1948,6 +1984,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
     AppendUiRect(vertices, kUiWidth - 2.0f, 0.0f, 2.0f, static_cast<float>(gWindowHeight),
                  {0.28f, 0.34f, 0.42f});
     AppendUiText(vertices, "MAP DRAWER", 12.0f, 12.0f, 2.5f, {0.90f, 0.76f, 0.35f});
+    AddUiButton(vertices, kUiWidth - 69.0f, 8.0f, 59.0f, 24.0f, "HELP", UiAction::Help);
 
     auto headingText = [&](const char *text, float y) { AppendUiText(vertices, text, 10.0f, y, 1.5f, heading); };
     constexpr float x0 = 10.0f, h = 24.0f;
@@ -2152,10 +2189,15 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
         gUiHits.clear();
         AppendUiRect(vertices, 0.0f, 0.0f, static_cast<float>(gWindowWidth),
                      static_cast<float>(gWindowHeight), {0.01f, 0.01f, 0.02f}, 0.72f);
-        float mw = 560.0f;
-        float mh = (gModalType == ModalType::Info || gModalType == ModalType::Confirm)
-                       ? 320.0f
-                       : (gModalFields.size() > 1 ? 290.0f : 220.0f);
+        const bool keybindHelp =
+            gModalType == ModalType::Info && gInfoTitle == "KEYBOARD & MOUSE HELP";
+        float mw = keybindHelp ? std::min(760.0f, static_cast<float>(gWindowWidth) - 60.0f)
+                               : 560.0f;
+        float mh = keybindHelp
+                       ? std::min(760.0f, static_cast<float>(gWindowHeight) - 60.0f)
+                       : ((gModalType == ModalType::Info || gModalType == ModalType::Confirm)
+                              ? 320.0f
+                              : (gModalFields.size() > 1 ? 290.0f : 220.0f));
         float mx = (gWindowWidth - mw) * 0.5f, my = (gWindowHeight - mh) * 0.5f;
         AppendUiRect(vertices, mx, my, mw, mh, {0.10f, 0.12f, 0.16f});
         AppendUiRect(vertices, mx, my, mw, 4.0f, {0.75f, 0.57f, 0.20f});
@@ -2171,9 +2213,19 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
             AppendUiText(vertices, "TILE " + std::to_string(gModalCol) + " " + std::to_string(gModalRow),
                          mx + 350.0f, my + 29.0f, 1.5f, {0.72f, 0.77f, 0.84f}, 24);
         if (gModalType == ModalType::Info) {
-            for (size_t i = 0; i < gInfoLines.size(); ++i)
-                AppendUiText(vertices, gInfoLines[i], mx + 24.0f, my + 72.0f + static_cast<float>(i) * 34.0f,
-                             1.8f, {0.88f, 0.90f, 0.94f}, 62);
+            const float lineSpacing = keybindHelp ? 22.0f : 34.0f;
+            for (size_t i = 0; i < gInfoLines.size(); ++i) {
+                const bool sectionHeading =
+                    keybindHelp && (gInfoLines[i] == "NAVIGATION" || gInfoLines[i] == "PAINTING" ||
+                                    gInfoLines[i] == "TOOLS" ||
+                                    gInfoLines[i] == "WORLD AND PROJECT");
+                const float textScale = keybindHelp ? (sectionHeading ? 1.65f : 1.45f) : 1.8f;
+                const Vec3 textColor = sectionHeading ? Vec3{0.90f, 0.76f, 0.35f}
+                                                      : Vec3{0.88f, 0.90f, 0.94f};
+                AppendUiText(vertices, gInfoLines[i], mx + 24.0f,
+                             my + 72.0f + static_cast<float>(i) * lineSpacing, textScale,
+                             textColor, keybindHelp ? 88 : 62);
+            }
             AddUiButton(vertices, mx + mw - 112.0f, my + mh - 48.0f, 88.0f, 28.0f,
                         "CLOSE", UiAction::ModalCancel);
         } else if (gModalType == ModalType::Confirm) {
@@ -2265,6 +2317,7 @@ void HandleUiAction(const UiHit &hit) {
         case UiAction::DeleteMarker: RemoveMarkerAtCursor(); break;
         case UiAction::DeleteRoute: RemoveRouteAtCursor(); break;
         case UiAction::WorldInfo: PrintWorldInfo(); break;
+        case UiAction::Help: OpenKeybindHelp(); break;
         case UiAction::Find: OpenModal(ModalType::Search, {gLastSearchQuery}); break;
         case UiAction::RollEncounter: RollEncounterAtCursor(); break;
         case UiAction::Undo: Undo(); break;
@@ -2640,7 +2693,9 @@ void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int 
     }
     if (action != GLFW_PRESS) return;
 
-    if (key == GLFW_KEY_F && (mods & GLFW_MOD_CONTROL)) {
+    if (key == GLFW_KEY_SLASH && (mods & GLFW_MOD_SHIFT)) {
+        OpenKeybindHelp();
+    } else if (key == GLFW_KEY_F && (mods & GLFW_MOD_CONTROL)) {
         OpenModal(ModalType::Search, {gLastSearchQuery});
     } else if (key == GLFW_KEY_E && (mods & GLFW_MOD_CONTROL)) {
         RollEncounterAtCursor();
@@ -3595,6 +3650,7 @@ int main() {
     LOG_INFO("  Ctrl+S / Ctrl+L   : save / load project (map_drawer_project.txt)");
     LOG_INFO("                      Load falls back to legacy multi-file projects when needed");
     LOG_INFO("  Autosave          : recovery copy written every five minutes while modified");
+    LOG_INFO("  Help / ?          : show the in-application keybind reference");
     LOG_INFO("  Escape            : quit");
 
     double lastTime = glfwGetTime();

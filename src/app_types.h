@@ -62,7 +62,7 @@ enum class ConfirmAction { None, ClearLayer, LoadProject, OverwriteProject, Reco
 enum class UiAction {
     None, SetMode, SetTool, SetTerrain, SetElevationValue, SetElevationTool,
     ElevationDown, ElevationUp, BrushDown, BrushUp, ToggleShape,
-    NewRegion, CycleRegion, NewCity, NewPoi, DeleteMarker, DeleteRoute, WorldInfo, Find, RollEncounter,
+    NewRegion, CycleRegion, NewCity, NewPoi, DeleteMarker, DeleteRoute, WorldInfo, Help, Find, RollEncounter,
     Undo, Redo, Save, Load, Clear, Export, ToggleGrid, ToggleGeometry, ToggleRegions,
     ToggleLabels, TogglePlayerView, ToggleElevationView, ToggleContours, ToggleHillshade, GenerateRelief,
     FogHideAll, FogRevealAll, ResetCamera, FitMap, ProjectName,
@@ -117,4 +117,3 @@ const char *PaintModeName(PaintMode mode);
 const char *ElevationEditModeName(ElevationEditMode mode);
 Vec3 ElevationBandColor(int elevation);
 const char *ToolName(ToolMode mode);
-
