@@ -2,8 +2,14 @@
 // An infinite, pannable/zoomable tile-based map painter: pick a terrain brush with
 // number keys, paint tiles with the mouse, pan with WASD/arrows, zoom with the
 // scroll wheel, and save/load the world as one versioned project file.
-#include "gl_lite.h"
+#include "app_config.h"
+#include "app_types.h"
 #include "logger.h"
+#include "grid_geometry.h"
+#include "mesh_buffer.h"
+#include "project_document.h"
+#include "shader_program.h"
+#include "tiny_font.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -31,209 +37,11 @@
 #include <utility>
 #include <vector>
 
-constexpr const char *kLogFile = "map_drawer.log";
-
 namespace {
 
-// ---- Map configuration -----------------------------------------------------
-// The map is an unbounded sparse grid (any col/row, positive or negative, may be
-// painted); only tiles actually painted are stored, so the "world" has no size limit.
-constexpr float kTileSize = 32.0f;
-constexpr float kUiWidth = 264.0f;
-constexpr double kHexRowHeight = kTileSize * 0.8660254037844386;
-constexpr double kHexColSpacing = kTileSize * 0.75;
-constexpr int kTerrainCount = 8;
-constexpr const char *kMapFile = "map.txt";
-constexpr double kPanSpeed = 600.0;   // screen pixels/sec at any zoom level
-constexpr double kMinZoom = 0.05;
-constexpr double kMaxZoom = 8.0;
-constexpr int kMaxBrushRadius = 6;
-constexpr int kFloodFillLimit = 200000; // safety cap so filling unbounded empty space can't hang
-constexpr size_t kMaxUndoStrokes = 200;
-constexpr size_t kBulkReserveLimit = 2000000;
-constexpr const char *kScreenshotFile = "map_export.bmp";
-constexpr const char *kRegionsFile = "regions.txt";
-constexpr const char *kCitiesFile = "cities.txt";
-constexpr const char *kPoisFile = "pois.txt";
-constexpr const char *kRoutesFile = "routes.txt";
-constexpr const char *kElevationFile = "elevation.txt";
-constexpr const char *kDefaultProjectFile = "map_drawer_project.txt";
-constexpr const char *kAutosaveFile = "map_drawer_autosave.txt";
-constexpr const char *kConfigFile = "map_drawer.cfg";
-constexpr const char *kBackupDirectory = "backups";
-constexpr double kAutosaveIntervalSeconds = 5.0 * 60.0;
-constexpr double kKilometresPerTile = 10.0;
-constexpr double kWalkingKilometresPerDay = 40.0;
-constexpr int kProjectVersion = 3;
-constexpr int kMinElevation = -4;
-constexpr int kMaxElevation = 8;
-constexpr int kDefaultMetresPerElevationLevel = 250;
-constexpr int kNoPaintValue = -1000;
-constexpr int kMaxRegions = 255; // region ids share the uint8_t tile-layer storage
-constexpr float kRegionOverlayAlpha = 0.4f;
-constexpr float kScatterDensity = 0.35f;
-constexpr double kPi = 3.14159265358979323846;
-
-struct Vec3 {
-    float r, g, b;
-};
-
-// ---- Tiny 3x5 pixel font (uppercase letters, digits, space, ' . -) for in-map labels ----
-struct Glyph3x5 {
-    uint8_t rows[5]; // each row uses bits 2,1,0 for left,mid,right columns
-};
-
-Glyph3x5 GetGlyph(char c) {
-    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    switch (c) {
-        case 'A': return {{0b010, 0b101, 0b111, 0b101, 0b101}};
-        case 'B': return {{0b110, 0b101, 0b110, 0b101, 0b110}};
-        case 'C': return {{0b011, 0b100, 0b100, 0b100, 0b011}};
-        case 'D': return {{0b110, 0b101, 0b101, 0b101, 0b110}};
-        case 'E': return {{0b111, 0b100, 0b110, 0b100, 0b111}};
-        case 'F': return {{0b111, 0b100, 0b110, 0b100, 0b100}};
-        case 'G': return {{0b011, 0b100, 0b101, 0b101, 0b011}};
-        case 'H': return {{0b101, 0b101, 0b111, 0b101, 0b101}};
-        case 'I': return {{0b111, 0b010, 0b010, 0b010, 0b111}};
-        case 'J': return {{0b001, 0b001, 0b001, 0b101, 0b010}};
-        case 'K': return {{0b101, 0b101, 0b110, 0b101, 0b101}};
-        case 'L': return {{0b100, 0b100, 0b100, 0b100, 0b111}};
-        case 'M': return {{0b101, 0b111, 0b101, 0b101, 0b101}};
-        case 'N': return {{0b101, 0b111, 0b111, 0b111, 0b101}};
-        case 'O': return {{0b010, 0b101, 0b101, 0b101, 0b010}};
-        case 'P': return {{0b110, 0b101, 0b110, 0b100, 0b100}};
-        case 'Q': return {{0b010, 0b101, 0b101, 0b110, 0b011}};
-        case 'R': return {{0b110, 0b101, 0b110, 0b101, 0b101}};
-        case 'S': return {{0b011, 0b100, 0b010, 0b001, 0b110}};
-        case 'T': return {{0b111, 0b010, 0b010, 0b010, 0b010}};
-        case 'U': return {{0b101, 0b101, 0b101, 0b101, 0b010}};
-        case 'V': return {{0b101, 0b101, 0b101, 0b010, 0b010}};
-        case 'W': return {{0b101, 0b101, 0b101, 0b111, 0b101}};
-        case 'X': return {{0b101, 0b101, 0b010, 0b101, 0b101}};
-        case 'Y': return {{0b101, 0b101, 0b010, 0b010, 0b010}};
-        case 'Z': return {{0b111, 0b001, 0b010, 0b100, 0b111}};
-        case '0': return {{0b010, 0b101, 0b101, 0b101, 0b010}};
-        case '1': return {{0b010, 0b110, 0b010, 0b010, 0b111}};
-        case '2': return {{0b110, 0b001, 0b010, 0b100, 0b111}};
-        case '3': return {{0b110, 0b001, 0b010, 0b001, 0b110}};
-        case '4': return {{0b101, 0b101, 0b111, 0b001, 0b001}};
-        case '5': return {{0b111, 0b100, 0b110, 0b001, 0b110}};
-        case '6': return {{0b011, 0b100, 0b110, 0b101, 0b010}};
-        case '7': return {{0b111, 0b001, 0b010, 0b010, 0b010}};
-        case '8': return {{0b010, 0b101, 0b010, 0b101, 0b010}};
-        case '9': return {{0b010, 0b101, 0b011, 0b001, 0b010}};
-        case '\'': return {{0b010, 0b010, 0b000, 0b000, 0b000}};
-        case '.': return {{0b000, 0b000, 0b000, 0b000, 0b010}};
-        case '-': return {{0b000, 0b000, 0b111, 0b000, 0b000}};
-        case ':': return {{0b000, 0b010, 0b000, 0b010, 0b000}};
-        case '+': return {{0b000, 0b010, 0b111, 0b010, 0b000}};
-        case '/': return {{0b001, 0b001, 0b010, 0b100, 0b100}};
-        case '?': return {{0b110, 0b001, 0b010, 0b000, 0b010}};
-        case '[': return {{0b110, 0b100, 0b100, 0b100, 0b110}};
-        case ']': return {{0b011, 0b001, 0b001, 0b001, 0b011}};
-        case '_': return {{0b000, 0b000, 0b000, 0b000, 0b111}};
-        default: return {{0b000, 0b000, 0b000, 0b000, 0b000}}; // space / unsupported glyph
-    }
-}
-
+// World-space size of the tiny in-map font.
 constexpr float kLabelPixelSize = kTileSize * 0.11f; // world size of one font "pixel"
 constexpr float kLabelGlyphAdvance = kLabelPixelSize * 4.0f; // 3 cols + 1 gap
-
-// Distinct region colors, cycled by region id so newly founded realms are easy to tell apart.
-const Vec3 kRegionPalette[] = {
-    {0.85f, 0.20f, 0.20f}, {0.20f, 0.45f, 0.85f}, {0.85f, 0.65f, 0.15f},
-    {0.55f, 0.20f, 0.75f}, {0.20f, 0.75f, 0.55f}, {0.85f, 0.35f, 0.60f},
-    {0.45f, 0.80f, 0.20f}, {0.30f, 0.30f, 0.90f}, {0.90f, 0.50f, 0.20f},
-    {0.20f, 0.85f, 0.85f},
-};
-constexpr int kRegionPaletteSize = sizeof(kRegionPalette) / sizeof(kRegionPalette[0]);
-
-struct Region {
-    int id = 0;
-    Vec3 color{};
-    std::string name;
-    std::string ruler;
-};
-
-struct City {
-    int32_t col = 0, row = 0;
-    std::string name;
-    std::string ruler;
-};
-
-enum class PoiKind { Dungeon, Ruin, Landmark, Temple, Camp };
-constexpr int kPoiKindCount = 5;
-
-struct PointOfInterest {
-    int32_t col = 0, row = 0;
-    PoiKind kind = PoiKind::Landmark;
-    std::string name;
-    std::string description;
-};
-
-const char *PoiKindName(PoiKind kind) {
-    switch (kind) {
-        case PoiKind::Dungeon: return "Dungeon";
-        case PoiKind::Ruin: return "Ruin";
-        case PoiKind::Landmark: return "Landmark";
-        case PoiKind::Temple: return "Temple";
-        case PoiKind::Camp: return "Camp";
-    }
-    return "?";
-}
-
-// Marker shape (regular polygon side count + rotation) and color used to draw each POI kind.
-struct PoiVisual {
-    int sides;
-    float rotation;
-    Vec3 color;
-};
-
-PoiVisual GetPoiVisual(PoiKind kind) {
-    switch (kind) {
-        case PoiKind::Dungeon: return {3, static_cast<float>(kPi) / 2.0f, {0.80f, 0.15f, 0.15f}};
-        case PoiKind::Ruin: return {4, static_cast<float>(kPi) / 4.0f, {0.55f, 0.55f, 0.55f}};
-        case PoiKind::Landmark: return {3, -static_cast<float>(kPi) / 2.0f, {0.25f, 0.75f, 0.35f}};
-        case PoiKind::Temple: return {8, 0.0f, {0.60f, 0.30f, 0.80f}};
-        case PoiKind::Camp: return {6, 0.0f, {0.90f, 0.55f, 0.15f}};
-    }
-    return {4, 0.0f, {1.0f, 1.0f, 1.0f}};
-}
-
-enum class RouteKind { River, TradeRoute };
-
-struct Route {
-    RouteKind kind = RouteKind::River;
-    std::string name;
-    std::vector<std::pair<double, double>> points; // world-space polyline
-};
-
-Vec3 RouteColor(RouteKind kind) {
-    return kind == RouteKind::River ? Vec3{0.20f, 0.55f, 0.85f} : Vec3{0.75f, 0.60f, 0.30f};
-}
-
-float RouteThickness(RouteKind kind) {
-    return kind == RouteKind::River ? kTileSize * 0.35f : kTileSize * 0.18f;
-}
-
-const char *RouteKindName(RouteKind kind) {
-    return kind == RouteKind::River ? "River" : "Trade Route";
-}
-
-const Vec3 kTerrainColors[kTerrainCount] = {
-    {0.15f, 0.15f, 0.17f}, // 0: empty (unused: empty tiles are simply not stored)
-    {0.45f, 0.65f, 0.25f}, // 1: plains
-    {0.13f, 0.35f, 0.13f}, // 2: forest
-    {0.15f, 0.45f, 0.75f}, // 3: water
-    {0.55f, 0.52f, 0.50f}, // 4: mountain
-    {0.85f, 0.75f, 0.45f}, // 5: desert
-    {0.55f, 0.55f, 0.25f}, // 6: hills
-    {0.55f, 0.40f, 0.22f}, // 7: road
-};
-
-const char *kTerrainNames[kTerrainCount] = {
-    "Empty", "Plains", "Forest", "Water", "Mountain", "Desert", "Hills", "Road",
-};
 
 const char *kVertexShaderSource = R"glsl(
 #version 330 core
@@ -262,56 +70,6 @@ void main() {
 }
 )glsl";
 
-// Packs a (col, row) tile coordinate into a single hash-map key.
-uint64_t TileKey(int32_t col, int32_t row) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(col)) << 32) |
-           static_cast<uint32_t>(row);
-}
-
-enum class PaintMode { Terrain, Region, Elevation, Fog };
-enum class ElevationEditMode { Set, Raise, Lower, Flatten, Smooth };
-
-struct TileChange {
-    uint64_t key;
-    int16_t oldValue;
-    int16_t newValue;
-};
-
-struct SearchResult {
-    std::string label;
-    double worldX = 0.0;
-    double worldY = 0.0;
-};
-struct StrokeRecord {
-    PaintMode layer;
-    std::vector<TileChange> changes;
-};
-
-enum class ToolMode { Brush, FloodFill, Line, Curve, Polygon, Circle, Scatter, River, TradeRoute, Selection, Measure };
-enum class ModalType { None, Region, City, Poi, Route, Info, Confirm, ProjectName, Search };
-enum class PlacementMode { None, City, Poi };
-enum class ConfirmAction { None, ClearLayer, LoadProject, OverwriteProject, RecoverAutosave, GenerateRelief };
-enum class UiAction {
-    None, SetMode, SetTool, SetTerrain, SetElevationValue, SetElevationTool,
-    ElevationDown, ElevationUp, BrushDown, BrushUp, ToggleShape,
-    NewRegion, CycleRegion, NewCity, NewPoi, DeleteMarker, DeleteRoute, WorldInfo, Find, RollEncounter,
-    Undo, Redo, Save, Load, Clear, Export, ToggleGrid, ToggleGeometry, ToggleRegions,
-    ToggleLabels, TogglePlayerView, ToggleElevationView, ToggleContours, ToggleHillshade, GenerateRelief,
-    FogHideAll, FogRevealAll, ResetCamera, FitMap, ProjectName,
-    SelectionCopy, SelectionCut, SelectionPaste, SelectionDelete,
-    SelectionPaint, SelectionRegion, SelectionElevationDown, SelectionElevationUp, SelectionClear,
-    ModalPrevious, ModalNext, ModalAccept, ModalCancel, ModalPoiKind
-};
-struct UiHit {
-    float x, y, w, h;
-    UiAction action;
-    int value = 0;
-};
-struct ClipboardTile {
-    int32_t dc = 0, dr = 0;
-    int16_t value = 0;
-};
-const char *ToolName(ToolMode mode); // defined near the tool-selection key handling below
 void UpdateWindowTitle();
 void SelectTool(ToolMode mode);
 void SaveProjectNow();
@@ -325,17 +83,28 @@ void LoadProjectConfig();
 void CheckForRecoveryAutosave();
 void GenerateTerrainRelief();
 
-// ---- App state ------------------------------------------------------------
-std::unordered_map<uint64_t, uint8_t> gMapData;
-std::unordered_map<uint64_t, uint8_t> gRegionData; // tile key -> region id (0 = unclaimed)
-std::unordered_map<uint64_t, int8_t> gElevationData; // tile key -> signed height (-4..+8, 0 omitted)
-std::unordered_map<uint64_t, uint8_t> gFogData; // tile key -> hidden from players (1 = obscured)
-std::unordered_map<int, Region> gRegions;
+// Persisted world data lives together; aliases keep the editing code concise while
+// making the ownership boundary explicit for save/load operations.
+ProjectDocument gProjectDocument;
+auto &gMapData = gProjectDocument.terrain;
+auto &gRegionData = gProjectDocument.regionsByTile;
+auto &gElevationData = gProjectDocument.elevation;
+auto &gFogData = gProjectDocument.fog;
+auto &gRegions = gProjectDocument.regions;
+auto &gCities = gProjectDocument.cities;
+auto &gPois = gProjectDocument.pointsOfInterest;
+auto &gRoutes = gProjectDocument.routes;
+bool &gHexGrid = gProjectDocument.hexGrid;
+int &gMetresPerElevationLevel = gProjectDocument.metresPerElevationLevel;
+int &gSeaLevel = gProjectDocument.seaLevel;
+int &gContourInterval = gProjectDocument.contourInterval;
+bool &gElevationView = gProjectDocument.elevationView;
+bool &gShowElevationContours = gProjectDocument.showContours;
+bool &gShowHillshade = gProjectDocument.showHillshade;
+
+// ---- Transient editor state -----------------------------------------------
 int gNextRegionId = 1;
 int gActiveRegionId = 0;
-std::vector<City> gCities;
-std::vector<PointOfInterest> gPois;
-std::vector<Route> gRoutes;
 std::vector<std::pair<double, double>> gRoutePoints; // pending River/TradeRoute path being drawn
 PaintMode gPaintMode = PaintMode::Terrain;
 bool gShowRegions = true;
@@ -343,18 +112,11 @@ bool gShowLabels = true;
 int gBrush = 1;
 int gElevationBrush = 1;
 ElevationEditMode gElevationEditMode = ElevationEditMode::Set;
-bool gElevationView = false;
-bool gShowElevationContours = true;
-bool gShowHillshade = true;
-int gMetresPerElevationLevel = kDefaultMetresPerElevationLevel;
-int gSeaLevel = 0;
-int gContourInterval = 1;
 bool gFlattenHeightCaptured = false;
 int gFlattenHeight = 0;
 int gBrushRadius = 0; // 0 = single tile, N = (2N+1)x(2N+1) square
 bool gRoundBrush = false; // false = square stamp, true = circular stamp (more organic edges)
 bool gShowGrid = true;
-bool gHexGrid = true; // hexagons are the default; Y remains available for legacy square maps
 bool gPlayerView = false;
 ToolMode gToolMode = ToolMode::Brush;
 bool gPaintingLeft = false;
@@ -443,110 +205,31 @@ void WindowSizeCallback(GLFWwindow * /*window*/, int width, int height) {
     gWindowHeight = height;
 }
 
-GLuint CompileShader(GLenum type, const char *source) {
-    GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, nullptr);
-    glCompileShader(shader);
-
-    GLint success = 0;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        char infoLog[512];
-        glGetShaderInfoLog(shader, sizeof(infoLog), nullptr, infoLog);
-        LOG_ERROR("Shader compilation failed: %s", infoLog);
-    }
-    return shader;
-}
-
-GLuint CreateShaderProgram() {
-    GLuint vertexShader = CompileShader(GL_VERTEX_SHADER, kVertexShaderSource);
-    GLuint fragmentShader = CompileShader(GL_FRAGMENT_SHADER, kFragmentShaderSource);
-
-    GLuint program = glCreateProgram();
-    glAttachShader(program, vertexShader);
-    glAttachShader(program, fragmentShader);
-    glLinkProgram(program);
-
-    GLint success = 0;
-    glGetProgramiv(program, GL_LINK_STATUS, &success);
-    if (!success) {
-        char infoLog[512];
-        glGetProgramInfoLog(program, sizeof(infoLog), nullptr, infoLog);
-        LOG_ERROR("Shader program linking failed: %s", infoLog);
-    }
-
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
-    return program;
+uint64_t TileKey(int32_t col, int32_t row) {
+    return grid_geometry::Pack(col, row);
 }
 
 std::pair<double, double> TileCenterWorld(int32_t col, int32_t row) {
-    if (!gHexGrid) return {(col + 0.5) * kTileSize, (row + 0.5) * kTileSize};
-    double rowOffset = (col % 2 != 0) ? 0.5 : 0.0;
-    return {col * kHexColSpacing + kTileSize * 0.5,
-            (row + rowOffset + 0.5) * kHexRowHeight};
+    return grid_geometry::TileCenter(col, row, gHexGrid);
 }
 
 std::pair<int32_t, int32_t> TileCoords(uint64_t key) {
-    return {static_cast<int32_t>(key >> 32), static_cast<int32_t>(key & 0xFFFFFFFFu)};
+    return grid_geometry::Unpack(key);
 }
 
 std::pair<int32_t, int32_t> WorldToTile(double worldX, double worldY) {
-    if (!gHexGrid) {
-        return {static_cast<int32_t>(std::floor(worldX / kTileSize)),
-                static_cast<int32_t>(std::floor(worldY / kTileSize))};
-    }
-
-    int32_t approxCol = static_cast<int32_t>(std::llround((worldX - kTileSize * 0.5) / kHexColSpacing));
-    int32_t bestCol = approxCol, bestRow = 0;
-    double bestDistance = std::numeric_limits<double>::max();
-    for (int32_t col = approxCol - 2; col <= approxCol + 2; ++col) {
-        double rowOffset = (col % 2 != 0) ? 0.5 : 0.0;
-        int32_t approxRow = static_cast<int32_t>(
-            std::llround(worldY / kHexRowHeight - rowOffset - 0.5));
-        for (int32_t row = approxRow - 2; row <= approxRow + 2; ++row) {
-            auto [cx, cy] = TileCenterWorld(col, row);
-            double dx = cx - worldX, dy = cy - worldY;
-            double distance = dx * dx + dy * dy;
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                bestCol = col;
-                bestRow = row;
-            }
-        }
-    }
-    return {bestCol, bestRow};
+    return grid_geometry::WorldToTile(worldX, worldY, gHexGrid);
 }
 
 double MeasuredTileDistance() {
-    if (gHexGrid) {
-        auto axialRow = [](int32_t col, int32_t row) {
-            return row - (col - (col & 1)) / 2;
-        };
-        int64_t q1 = gMeasureStartCol;
-        int64_t r1 = axialRow(gMeasureStartCol, gMeasureStartRow);
-        int64_t q2 = gMeasureEndCol;
-        int64_t r2 = axialRow(gMeasureEndCol, gMeasureEndRow);
-        int64_t dq = q2 - q1, dr = r2 - r1;
-        return static_cast<double>((std::llabs(dq) + std::llabs(dr) + std::llabs(dq + dr)) / 2);
-    }
-    return std::hypot(static_cast<double>(gMeasureEndCol) - gMeasureStartCol,
-                      static_cast<double>(gMeasureEndRow) - gMeasureStartRow);
+    return grid_geometry::TileDistance(gMeasureStartCol, gMeasureStartRow,
+                                       gMeasureEndCol, gMeasureEndRow, gHexGrid);
 }
 
 void TileBoundsForWorldRect(double minX, double minY, double maxX, double maxY,
                             int32_t &minCol, int32_t &minRow, int32_t &maxCol, int32_t &maxRow) {
-    if (!gHexGrid) {
-        minCol = static_cast<int32_t>(std::floor(minX / kTileSize)) - 1;
-        minRow = static_cast<int32_t>(std::floor(minY / kTileSize)) - 1;
-        maxCol = static_cast<int32_t>(std::floor(maxX / kTileSize)) + 1;
-        maxRow = static_cast<int32_t>(std::floor(maxY / kTileSize)) + 1;
-    } else {
-        minCol = static_cast<int32_t>(std::floor((minX - kTileSize) / kHexColSpacing)) - 1;
-        maxCol = static_cast<int32_t>(std::ceil((maxX + kTileSize) / kHexColSpacing)) + 1;
-        minRow = static_cast<int32_t>(std::floor((minY - kHexRowHeight) / kHexRowHeight)) - 1;
-        maxRow = static_cast<int32_t>(std::ceil((maxY + kHexRowHeight) / kHexRowHeight)) + 1;
-    }
+    grid_geometry::BoundsForWorldRect(minX, minY, maxX, maxY, gHexGrid,
+                                      minCol, minRow, maxCol, maxRow);
 }
 
 void VisibleTileBounds(int32_t &minCol, int32_t &minRow, int32_t &maxCol, int32_t &maxRow) {
@@ -626,50 +309,8 @@ void FitMapToWindow() {
              gZoom * 100.0);
 }
 
-const char *PaintModeName(PaintMode mode) {
-    switch (mode) {
-        case PaintMode::Terrain: return "Terrain";
-        case PaintMode::Region: return "Region";
-        case PaintMode::Elevation: return "Elevation";
-        case PaintMode::Fog: return "Fog";
-    }
-    return "?";
-}
-
-const char *ElevationEditModeName(ElevationEditMode mode) {
-    switch (mode) {
-        case ElevationEditMode::Set: return "Set";
-        case ElevationEditMode::Raise: return "Raise";
-        case ElevationEditMode::Lower: return "Lower";
-        case ElevationEditMode::Flatten: return "Flatten";
-        case ElevationEditMode::Smooth: return "Smooth";
-    }
-    return "?";
-}
-
-Vec3 ElevationBandColor(int elevation) {
-    static constexpr Vec3 colors[] = {
-        {0.04f, 0.12f, 0.34f}, {0.05f, 0.24f, 0.55f}, {0.08f, 0.42f, 0.70f},
-        {0.12f, 0.60f, 0.67f}, {0.22f, 0.60f, 0.28f}, {0.48f, 0.70f, 0.24f},
-        {0.72f, 0.68f, 0.22f}, {0.72f, 0.48f, 0.18f}, {0.54f, 0.31f, 0.16f},
-        {0.38f, 0.27f, 0.23f}, {0.48f, 0.48f, 0.48f}, {0.68f, 0.68f, 0.68f},
-        {0.92f, 0.93f, 0.95f},
-    };
-    return colors[std::clamp(elevation, kMinElevation, kMaxElevation) - kMinElevation];
-}
-
 std::array<std::pair<int32_t, int32_t>, 8> NeighborTiles(int32_t col, int32_t row, int &count) {
-    if (!gHexGrid) {
-        count = 8;
-        return {{{col - 1, row - 1}, {col, row - 1}, {col + 1, row - 1}, {col - 1, row},
-                 {col + 1, row}, {col - 1, row + 1}, {col, row + 1}, {col + 1, row + 1}}};
-    }
-    count = 6;
-    if ((col & 1) == 0)
-        return {{{col, row - 1}, {col + 1, row - 1}, {col + 1, row}, {col, row + 1},
-                 {col - 1, row}, {col - 1, row - 1}, {col, row}, {col, row}}};
-    return {{{col, row - 1}, {col + 1, row}, {col + 1, row + 1}, {col, row + 1},
-             {col - 1, row + 1}, {col - 1, row}, {col, row}, {col, row}}};
+    return grid_geometry::Neighbors(col, row, gHexGrid, count);
 }
 
 int GetLayerValue(PaintMode layer, uint64_t key) {
@@ -1860,59 +1501,9 @@ void LoadRoutes() {
 }
 
 bool SaveProjectToPath(const std::string &path, bool announce) {
-    std::ofstream out(path);
-    if (!out) {
-        LOG_ERROR("Failed to open %s for writing", path.c_str());
-        return false;
-    }
-    out << std::setprecision(17);
-
-    auto writeTileLayer = [&](const char *name, const auto &layer) {
-        out << name << ' ' << layer.size() << '\n';
-        for (const auto &entry : layer) {
-            int32_t col = static_cast<int32_t>(entry.first >> 32);
-            int32_t row = static_cast<int32_t>(entry.first & 0xFFFFFFFFu);
-            out << col << ' ' << row << ' ' << static_cast<int>(entry.second) << '\n';
-        }
-    };
-
-    out << "MAP_DRAWER_PROJECT " << kProjectVersion << '\n';
-    out << "GRID " << (gHexGrid ? 1 : 0) << '\n';
-    out << "ELEVATION_SETTINGS " << gMetresPerElevationLevel << ' ' << gSeaLevel << ' '
-        << gContourInterval << ' ' << (gElevationView ? 1 : 0) << ' '
-        << (gShowElevationContours ? 1 : 0) << ' ' << (gShowHillshade ? 1 : 0) << '\n';
-    writeTileLayer("TERRAIN", gMapData);
-    writeTileLayer("ELEVATION", gElevationData);
-    writeTileLayer("FOG", gFogData);
-
-    out << "REGIONS " << gRegions.size() << '\n';
-    for (const auto &entry : gRegions) {
-        const Region &region = entry.second;
-        out << region.id << ' ' << region.color.r << ' ' << region.color.g << ' ' << region.color.b
-            << ' ' << std::quoted(region.name) << ' ' << std::quoted(region.ruler) << '\n';
-    }
-    writeTileLayer("REGION_TILES", gRegionData);
-
-    out << "CITIES " << gCities.size() << '\n';
-    for (const auto &city : gCities)
-        out << city.col << ' ' << city.row << ' ' << std::quoted(city.name) << ' '
-            << std::quoted(city.ruler) << '\n';
-
-    out << "POIS " << gPois.size() << '\n';
-    for (const auto &poi : gPois)
-        out << poi.col << ' ' << poi.row << ' ' << static_cast<int>(poi.kind) << ' '
-            << std::quoted(poi.name) << ' ' << std::quoted(poi.description) << '\n';
-
-    out << "ROUTES " << gRoutes.size() << '\n';
-    for (const auto &route : gRoutes) {
-        out << static_cast<int>(route.kind) << ' ' << route.points.size() << ' '
-            << std::quoted(route.name) << '\n';
-        for (const auto &point : route.points) out << point.first << ' ' << point.second << '\n';
-    }
-    out << "END\n";
-
-    if (!out) {
-        LOG_ERROR("Failed while writing %s", path.c_str());
+    std::string error;
+    if (!SaveProjectDocument(path, gProjectDocument, error)) {
+        LOG_ERROR("Failed to save %s: %s", path.c_str(), error.c_str());
         return false;
     }
     if (announce)
@@ -2015,207 +1606,21 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
         return true;
     }
 
-    std::unordered_map<uint64_t, uint8_t> mapData;
-    std::unordered_map<uint64_t, int8_t> elevationData;
-    std::unordered_map<uint64_t, uint8_t> regionData;
-    std::unordered_map<uint64_t, uint8_t> fogData;
-    std::unordered_map<int, Region> regions;
-    std::vector<City> cities;
-    std::vector<PointOfInterest> pois;
-    std::vector<Route> routes;
-    bool hexGrid = false;
-    int metresPerLevel = kDefaultMetresPerElevationLevel;
-    int seaLevel = 0;
-    int contourInterval = 1;
-    bool elevationView = false;
-    bool showContours = true;
-    bool showHillshade = true;
-
-    std::string tag;
+    in.close();
+    ProjectDocument loadedDocument;
     int version = 0;
-    in >> tag >> version;
-    if (!in || tag != "MAP_DRAWER_PROJECT" || version < 1 || version > kProjectVersion) {
-        LOG_ERROR("Unsupported or invalid project header in %s", path.c_str());
+    std::string error;
+    if (!LoadProjectDocument(path, loadedDocument, version, error)) {
+        LOG_ERROR("Failed to load %s: %s", path.c_str(), error.c_str());
         return false;
     }
-
-    int gridValue = 0;
-    in >> tag >> gridValue;
-    if (!in || tag != "GRID" || (gridValue != 0 && gridValue != 1)) {
-        LOG_ERROR("Invalid GRID section in %s", path.c_str());
-        return false;
-    }
-    hexGrid = (gridValue == 1);
-
-    if (version >= 3) {
-        int elevationViewValue = 0, contourValue = 0, hillshadeValue = 0;
-        in >> tag >> metresPerLevel >> seaLevel >> contourInterval >> elevationViewValue >> contourValue >>
-            hillshadeValue;
-        if (!in || tag != "ELEVATION_SETTINGS" || metresPerLevel <= 0 || metresPerLevel > 100000 ||
-            seaLevel < kMinElevation || seaLevel > kMaxElevation || contourInterval <= 0 ||
-            contourInterval > kMaxElevation - kMinElevation ||
-            (elevationViewValue != 0 && elevationViewValue != 1) ||
-            (contourValue != 0 && contourValue != 1) || (hillshadeValue != 0 && hillshadeValue != 1)) {
-            LOG_ERROR("Invalid ELEVATION_SETTINGS section in %s", path.c_str());
-            return false;
-        }
-        elevationView = elevationViewValue != 0;
-        showContours = contourValue != 0;
-        showHillshade = hillshadeValue != 0;
-    }
-
-    auto readCount = [&](const char *expected, size_t &count) {
-        in >> tag >> count;
-        return static_cast<bool>(in) && tag == expected;
-    };
-    auto readUnsignedLayer = [&](const char *name, auto &layer, int maxValue) {
-        size_t count = 0;
-        if (!readCount(name, count)) return false;
-        layer.reserve(count);
-        for (size_t i = 0; i < count; ++i) {
-            int32_t col = 0, row = 0;
-            int value = 0;
-            in >> col >> row >> value;
-            if (!in || value <= 0 || value > maxValue) return false;
-            layer[TileKey(col, row)] = static_cast<uint8_t>(value);
-        }
-        return true;
-    };
-
-    if (!readUnsignedLayer("TERRAIN", mapData, kTerrainCount - 1)) {
-        LOG_ERROR("Invalid TERRAIN section in %s", path.c_str());
-        return false;
-    }
-
-    size_t elevationCount = 0;
-    if (!readCount("ELEVATION", elevationCount)) {
-        LOG_ERROR("Invalid ELEVATION section in %s", path.c_str());
-        return false;
-    }
-    elevationData.reserve(elevationCount);
-    for (size_t i = 0; i < elevationCount; ++i) {
-        int32_t col = 0, row = 0;
-        int value = 0;
-        in >> col >> row >> value;
-        if (!in || value < kMinElevation || value > kMaxElevation || value == 0) {
-            LOG_ERROR("Invalid elevation tile in %s", path.c_str());
-            return false;
-        }
-        elevationData[TileKey(col, row)] = static_cast<int8_t>(value);
-    }
-
-    if (version >= 2 && !readUnsignedLayer("FOG", fogData, 1)) {
-        LOG_ERROR("Invalid FOG section in %s", path.c_str());
-        return false;
-    }
-
-    size_t regionCount = 0;
-    if (!readCount("REGIONS", regionCount)) {
-        LOG_ERROR("Invalid REGIONS section in %s", path.c_str());
-        return false;
-    }
-    int nextRegionId = 1;
-    for (size_t i = 0; i < regionCount; ++i) {
-        Region region;
-        in >> region.id >> region.color.r >> region.color.g >> region.color.b
-           >> std::quoted(region.name) >> std::quoted(region.ruler);
-        if (!in || region.id <= 0 || region.id > kMaxRegions) {
-            LOG_ERROR("Invalid region metadata in %s", path.c_str());
-            return false;
-        }
-        nextRegionId = std::max(nextRegionId, region.id + 1);
-        regions[region.id] = std::move(region);
-    }
-    if (!readUnsignedLayer("REGION_TILES", regionData, kMaxRegions)) {
-        LOG_ERROR("Invalid REGION_TILES section in %s", path.c_str());
-        return false;
-    }
-
-    size_t cityCount = 0;
-    if (!readCount("CITIES", cityCount)) {
-        LOG_ERROR("Invalid CITIES section in %s", path.c_str());
-        return false;
-    }
-    cities.reserve(cityCount);
-    for (size_t i = 0; i < cityCount; ++i) {
-        City city;
-        in >> city.col >> city.row >> std::quoted(city.name) >> std::quoted(city.ruler);
-        if (!in) {
-            LOG_ERROR("Invalid city data in %s", path.c_str());
-            return false;
-        }
-        cities.push_back(std::move(city));
-    }
-
-    size_t poiCount = 0;
-    if (!readCount("POIS", poiCount)) {
-        LOG_ERROR("Invalid POIS section in %s", path.c_str());
-        return false;
-    }
-    pois.reserve(poiCount);
-    for (size_t i = 0; i < poiCount; ++i) {
-        PointOfInterest poi;
-        int kind = 0;
-        in >> poi.col >> poi.row >> kind >> std::quoted(poi.name) >> std::quoted(poi.description);
-        if (!in || kind < 0 || kind >= kPoiKindCount) {
-            LOG_ERROR("Invalid point-of-interest data in %s", path.c_str());
-            return false;
-        }
-        poi.kind = static_cast<PoiKind>(kind);
-        pois.push_back(std::move(poi));
-    }
-
-    size_t routeCount = 0;
-    if (!readCount("ROUTES", routeCount)) {
-        LOG_ERROR("Invalid ROUTES section in %s", path.c_str());
-        return false;
-    }
-    routes.reserve(routeCount);
-    for (size_t i = 0; i < routeCount; ++i) {
-        Route route;
-        int kind = 0;
-        size_t pointCount = 0;
-        in >> kind >> pointCount >> std::quoted(route.name);
-        if (!in || (kind != 0 && kind != 1)) {
-            LOG_ERROR("Invalid route data in %s", path.c_str());
-            return false;
-        }
-        route.kind = (kind == 0) ? RouteKind::River : RouteKind::TradeRoute;
-        route.points.reserve(pointCount);
-        for (size_t p = 0; p < pointCount; ++p) {
-            double x = 0.0, y = 0.0;
-            in >> x >> y;
-            if (!in) {
-                LOG_ERROR("Invalid route point in %s", path.c_str());
-                return false;
-            }
-            route.points.emplace_back(x, y);
-        }
-        routes.push_back(std::move(route));
-    }
-    in >> tag;
-    if (!in || tag != "END") {
-        LOG_ERROR("Missing END marker in %s", path.c_str());
-        return false;
-    }
-
-    gMapData = std::move(mapData);
-    gElevationData = std::move(elevationData);
-    gFogData = std::move(fogData);
-    gRegionData = std::move(regionData);
-    gRegions = std::move(regions);
-    gCities = std::move(cities);
-    gPois = std::move(pois);
-    gRoutes = std::move(routes);
-    gHexGrid = hexGrid;
-    gMetresPerElevationLevel = metresPerLevel;
-    gSeaLevel = seaLevel;
-    gContourInterval = contourInterval;
-    gElevationView = elevationView;
-    gShowElevationContours = showContours;
-    gShowHillshade = showHillshade;
+    gProjectDocument = std::move(loadedDocument);
     gElevationEditMode = ElevationEditMode::Set;
-    gNextRegionId = nextRegionId;
+    gNextRegionId = 1;
+    for (const auto &[regionId, region] : gRegions) {
+        (void)region;
+        gNextRegionId = std::max(gNextRegionId, regionId + 1);
+    }
     gActiveRegionId = 0;
     gUndoStack.clear();
     gRedoStack.clear();
@@ -3190,23 +2595,6 @@ void ScrollCallback(GLFWwindow * /*window*/, double /*xoffset*/, double yoffset)
     UpdateWindowTitle();
 }
 
-const char *ToolName(ToolMode mode) {
-    switch (mode) {
-        case ToolMode::Brush: return "Brush";
-        case ToolMode::FloodFill: return "Flood Fill";
-        case ToolMode::Line: return "Line";
-        case ToolMode::Curve: return "Curve";
-        case ToolMode::Polygon: return "Polygon";
-        case ToolMode::Circle: return "Circle";
-        case ToolMode::Scatter: return "Scatter";
-        case ToolMode::River: return "River";
-        case ToolMode::TradeRoute: return "Trade Route";
-        case ToolMode::Selection: return "Selection";
-        case ToolMode::Measure: return "Measure";
-    }
-    return "?";
-}
-
 void SelectTool(ToolMode mode) {
     gToolMode = mode;
     gPlacementMode = PlacementMode::None;
@@ -4075,14 +3463,6 @@ void RebuildToolPreview(GLuint vbo, GLsizei &outVertexCount) {
     outVertexCount = static_cast<GLsizei>(vertices.size() / 6);
 }
 
-void SetupVertexLayout() {
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), reinterpret_cast<void *>(0));
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
-                          reinterpret_cast<void *>(2 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-}
-
 } // namespace
 
 int main() {
@@ -4135,93 +3515,17 @@ int main() {
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    GLuint shaderProgram = CreateShaderProgram();
+    GLuint shaderProgram = CreateShaderProgram(kVertexShaderSource, kFragmentShaderSource);
     glUseProgram(shaderProgram);
     GLint resolutionLoc = glGetUniformLocation(shaderProgram, "uResolution");
 
-    GLuint tileVao = 0, tileVbo = 0;
-    glGenVertexArrays(1, &tileVao);
-    glGenBuffers(1, &tileVbo);
-    glBindVertexArray(tileVao);
-    glBindBuffer(GL_ARRAY_BUFFER, tileVbo);
-    SetupVertexLayout();
-
-    GLuint gridVao = 0, gridVbo = 0;
-    glGenVertexArrays(1, &gridVao);
-    glGenBuffers(1, &gridVbo);
-    glBindVertexArray(gridVao);
-    glBindBuffer(GL_ARRAY_BUFFER, gridVbo);
-    SetupVertexLayout();
-
-    GLuint rectVao = 0, rectVbo = 0;
-    glGenVertexArrays(1, &rectVao);
-    glGenBuffers(1, &rectVbo);
-    glBindVertexArray(rectVao);
-    glBindBuffer(GL_ARRAY_BUFFER, rectVbo);
-    SetupVertexLayout();
-
-    GLuint regionVao = 0, regionVbo = 0;
-    glGenVertexArrays(1, &regionVao);
-    glGenBuffers(1, &regionVbo);
-    glBindVertexArray(regionVao);
-    glBindBuffer(GL_ARRAY_BUFFER, regionVbo);
-    SetupVertexLayout();
-
-    GLuint contourVao = 0, contourVbo = 0;
-    glGenVertexArrays(1, &contourVao);
-    glGenBuffers(1, &contourVbo);
-    glBindVertexArray(contourVao);
-    glBindBuffer(GL_ARRAY_BUFFER, contourVbo);
-    SetupVertexLayout();
-
-    GLuint fogVao = 0, fogVbo = 0;
-    glGenVertexArrays(1, &fogVao);
-    glGenBuffers(1, &fogVbo);
-    glBindVertexArray(fogVao);
-    glBindBuffer(GL_ARRAY_BUFFER, fogVbo);
-    SetupVertexLayout();
-
-    GLuint cityVao = 0, cityVbo = 0;
-    glGenVertexArrays(1, &cityVao);
-    glGenBuffers(1, &cityVbo);
-    glBindVertexArray(cityVao);
-    glBindBuffer(GL_ARRAY_BUFFER, cityVbo);
-    SetupVertexLayout();
-
-    GLuint poiVao = 0, poiVbo = 0;
-    glGenVertexArrays(1, &poiVao);
-    glGenBuffers(1, &poiVbo);
-    glBindVertexArray(poiVao);
-    glBindBuffer(GL_ARRAY_BUFFER, poiVbo);
-    SetupVertexLayout();
-
-    GLuint routeVao = 0, routeVbo = 0;
-    glGenVertexArrays(1, &routeVao);
-    glGenBuffers(1, &routeVbo);
-    glBindVertexArray(routeVao);
-    glBindBuffer(GL_ARRAY_BUFFER, routeVbo);
-    SetupVertexLayout();
-
-    GLuint toolVao = 0, toolVbo = 0;
-    glGenVertexArrays(1, &toolVao);
-    glGenBuffers(1, &toolVbo);
-    glBindVertexArray(toolVao);
-    glBindBuffer(GL_ARRAY_BUFFER, toolVbo);
-    SetupVertexLayout();
-
-    GLuint labelVao = 0, labelVbo = 0;
-    glGenVertexArrays(1, &labelVao);
-    glGenBuffers(1, &labelVbo);
-    glBindVertexArray(labelVao);
-    glBindBuffer(GL_ARRAY_BUFFER, labelVbo);
-    SetupVertexLayout();
-
-    GLuint guiVao = 0, guiVbo = 0;
-    glGenVertexArrays(1, &guiVao);
-    glGenBuffers(1, &guiVbo);
-    glBindVertexArray(guiVao);
-    glBindBuffer(GL_ARRAY_BUFFER, guiVbo);
-    SetupVertexLayout();
+    MeshBuffer tileMesh, gridMesh, selectionMesh, regionMesh, contourMesh, fogMesh;
+    MeshBuffer cityMesh, poiMesh, routeMesh, toolMesh, labelMesh, guiMesh;
+    std::array<MeshBuffer *, 12> meshes{
+        &tileMesh, &gridMesh, &selectionMesh, &regionMesh, &contourMesh, &fogMesh,
+        &cityMesh, &poiMesh, &routeMesh, &toolMesh, &labelMesh, &guiMesh,
+    };
+    for (MeshBuffer *mesh : meshes) mesh->Initialize();
 
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -4293,18 +3597,6 @@ int main() {
     LOG_INFO("  Autosave          : recovery copy written every five minutes while modified");
     LOG_INFO("  Escape            : quit");
 
-    GLsizei tileVertexCount = 0;
-    GLsizei gridVertexCount = 0;
-    GLsizei rectVertexCount = 0;
-    GLsizei regionVertexCount = 0;
-    GLsizei contourVertexCount = 0;
-    GLsizei fogVertexCount = 0;
-    GLsizei cityVertexCount = 0;
-    GLsizei poiVertexCount = 0;
-    GLsizei routeVertexCount = 0;
-    GLsizei toolVertexCount = 0;
-    GLsizei labelVertexCount = 0;
-    GLsizei guiVertexCount = 0;
     double lastTime = glfwGetTime();
     double lastAutosaveTime = lastTime;
     double lastRenderCameraX = std::numeric_limits<double>::quiet_NaN();
@@ -4331,15 +3623,15 @@ int main() {
                                   gZoom != lastRenderZoom || gWindowWidth != lastRenderWidth ||
                                   gWindowHeight != lastRenderHeight || gSceneRevision != lastSceneRevision;
         if (staticSceneChanged) {
-            RebuildVisibleTileMesh(tileVbo, tileVertexCount);
-            RebuildVisibleRegionOverlay(regionVbo, regionVertexCount);
-            RebuildElevationContours(contourVbo, contourVertexCount);
-            RebuildVisibleFogOverlay(fogVbo, fogVertexCount);
-            RebuildVisibleGridLines(gridVbo, gridVertexCount);
-            RebuildCityMarkers(cityVbo, cityVertexCount);
-            RebuildPoiMarkers(poiVbo, poiVertexCount);
-            RebuildRouteMesh(routeVbo, routeVertexCount);
-            RebuildLabelMesh(labelVbo, labelVertexCount);
+            RebuildVisibleTileMesh(tileMesh.Buffer(), tileMesh.VertexCount());
+            RebuildVisibleRegionOverlay(regionMesh.Buffer(), regionMesh.VertexCount());
+            RebuildElevationContours(contourMesh.Buffer(), contourMesh.VertexCount());
+            RebuildVisibleFogOverlay(fogMesh.Buffer(), fogMesh.VertexCount());
+            RebuildVisibleGridLines(gridMesh.Buffer(), gridMesh.VertexCount());
+            RebuildCityMarkers(cityMesh.Buffer(), cityMesh.VertexCount());
+            RebuildPoiMarkers(poiMesh.Buffer(), poiMesh.VertexCount());
+            RebuildRouteMesh(routeMesh.Buffer(), routeMesh.VertexCount());
+            RebuildLabelMesh(labelMesh.Buffer(), labelMesh.VertexCount());
             lastRenderCameraX = gCameraX;
             lastRenderCameraY = gCameraY;
             lastRenderZoom = gZoom;
@@ -4347,9 +3639,9 @@ int main() {
             lastRenderHeight = gWindowHeight;
             lastSceneRevision = gSceneRevision;
         }
-        RebuildRectPreview(rectVbo, rectVertexCount);
-        RebuildToolPreview(toolVbo, toolVertexCount);
-        RebuildGuiMesh(guiVbo, guiVertexCount);
+        RebuildRectPreview(selectionMesh.Buffer(), selectionMesh.VertexCount());
+        RebuildToolPreview(toolMesh.Buffer(), toolMesh.VertexCount());
+        RebuildGuiMesh(guiMesh.Buffer(), guiMesh.VertexCount());
 
         glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -4357,61 +3649,18 @@ int main() {
         glUseProgram(shaderProgram);
         glUniform2f(resolutionLoc, static_cast<float>(gWindowWidth), static_cast<float>(gWindowHeight));
 
-        glBindVertexArray(tileVao);
-        glDrawArrays(GL_TRIANGLES, 0, tileVertexCount);
-
-        if (gShowRegions && !gElevationView && regionVertexCount > 0) {
-            glBindVertexArray(regionVao);
-            glDrawArrays(GL_TRIANGLES, 0, regionVertexCount);
-        }
-
-        if (gShowGrid) {
-            glBindVertexArray(gridVao);
-            glDrawArrays(GL_LINES, 0, gridVertexCount);
-        }
-
-        if (contourVertexCount > 0) {
-            glBindVertexArray(contourVao);
-            glDrawArrays(GL_LINES, 0, contourVertexCount);
-        }
-
-        if (routeVertexCount > 0) {
-            glBindVertexArray(routeVao);
-            glDrawArrays(GL_TRIANGLES, 0, routeVertexCount);
-        }
-
-        if (cityVertexCount > 0) {
-            glBindVertexArray(cityVao);
-            glDrawArrays(GL_TRIANGLES, 0, cityVertexCount);
-        }
-
-        if (poiVertexCount > 0) {
-            glBindVertexArray(poiVao);
-            glDrawArrays(GL_TRIANGLES, 0, poiVertexCount);
-        }
-
-        if (gShowLabels && labelVertexCount > 0) {
-            glBindVertexArray(labelVao);
-            glDrawArrays(GL_TRIANGLES, 0, labelVertexCount);
-        }
-
-        if (fogVertexCount > 0) {
-            glBindVertexArray(fogVao);
-            glDrawArrays(GL_TRIANGLES, 0, fogVertexCount);
-        }
-
-        if (rectVertexCount > 0) {
-            glBindVertexArray(rectVao);
-            glDrawArrays(GL_LINES, 0, rectVertexCount);
-        }
-
-        if (toolVertexCount > 0) {
-            glBindVertexArray(toolVao);
-            glDrawArrays(GL_LINES, 0, toolVertexCount);
-        }
-
-        glBindVertexArray(guiVao);
-        glDrawArrays(GL_TRIANGLES, 0, guiVertexCount);
+        tileMesh.Draw(GL_TRIANGLES);
+        if (gShowRegions && !gElevationView) regionMesh.Draw(GL_TRIANGLES);
+        if (gShowGrid) gridMesh.Draw(GL_LINES);
+        contourMesh.Draw(GL_LINES);
+        routeMesh.Draw(GL_TRIANGLES);
+        cityMesh.Draw(GL_TRIANGLES);
+        poiMesh.Draw(GL_TRIANGLES);
+        if (gShowLabels) labelMesh.Draw(GL_TRIANGLES);
+        fogMesh.Draw(GL_TRIANGLES);
+        selectionMesh.Draw(GL_LINES);
+        toolMesh.Draw(GL_LINES);
+        guiMesh.Draw(GL_TRIANGLES);
 
         glfwSwapBuffers(gWindow);
         glfwPollEvents();
@@ -4420,30 +3669,7 @@ int main() {
     if (gProjectDirty && SaveProjectToPath(kAutosaveFile, false))
         LOG_INFO("Saved final recovery copy to %s", kAutosaveFile);
 
-    glDeleteVertexArrays(1, &tileVao);
-    glDeleteBuffers(1, &tileVbo);
-    glDeleteVertexArrays(1, &gridVao);
-    glDeleteBuffers(1, &gridVbo);
-    glDeleteVertexArrays(1, &rectVao);
-    glDeleteBuffers(1, &rectVbo);
-    glDeleteVertexArrays(1, &regionVao);
-    glDeleteBuffers(1, &regionVbo);
-    glDeleteVertexArrays(1, &contourVao);
-    glDeleteBuffers(1, &contourVbo);
-    glDeleteVertexArrays(1, &fogVao);
-    glDeleteBuffers(1, &fogVbo);
-    glDeleteVertexArrays(1, &cityVao);
-    glDeleteBuffers(1, &cityVbo);
-    glDeleteVertexArrays(1, &poiVao);
-    glDeleteBuffers(1, &poiVbo);
-    glDeleteVertexArrays(1, &routeVao);
-    glDeleteBuffers(1, &routeVbo);
-    glDeleteVertexArrays(1, &toolVao);
-    glDeleteBuffers(1, &toolVbo);
-    glDeleteVertexArrays(1, &labelVao);
-    glDeleteBuffers(1, &labelVbo);
-    glDeleteVertexArrays(1, &guiVao);
-    glDeleteBuffers(1, &guiVbo);
+    for (MeshBuffer *mesh : meshes) mesh->Release();
     glDeleteProgram(shaderProgram);
 
     glfwDestroyWindow(gWindow);

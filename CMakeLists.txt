@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(OpenGLTriangle LANGUAGES CXX)
+project(MapDrawer LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,16 +19,38 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glfw)
 
-add_executable(OpenGLTriangle
+add_executable(MapDrawer
     src/main.cpp
+    src/app_types.cpp
     src/gl_lite.cpp
+    src/grid_geometry.cpp
     src/logger.cpp
+    src/mesh_buffer.cpp
+    src/project_document.cpp
+    src/shader_program.cpp
+    src/tiny_font.cpp
 )
 
-target_include_directories(OpenGLTriangle PRIVATE src)
-target_link_libraries(OpenGLTriangle PRIVATE glfw opengl32)
+target_include_directories(MapDrawer PRIVATE src)
+target_link_libraries(MapDrawer PRIVATE glfw opengl32)
 
 if (MSVC)
-    target_compile_options(OpenGLTriangle PRIVATE /W4)
-    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT OpenGLTriangle)
+    target_compile_options(MapDrawer PRIVATE /W4)
+    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT MapDrawer)
+endif()
+
+include(CTest)
+if (BUILD_TESTING)
+    add_executable(MapDrawerCoreTests
+        tests/core_tests.cpp
+        src/app_types.cpp
+        src/grid_geometry.cpp
+        src/project_document.cpp
+        src/tiny_font.cpp
+    )
+    target_include_directories(MapDrawerCoreTests PRIVATE src)
+    if (MSVC)
+        target_compile_options(MapDrawerCoreTests PRIVATE /W4)
+    endif()
+    add_test(NAME MapDrawerCoreTests COMMAND MapDrawerCoreTests)
 endif()
