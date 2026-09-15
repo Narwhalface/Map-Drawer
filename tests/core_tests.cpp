@@ -4,6 +4,7 @@
 #include "tiny_font.h"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -50,7 +51,10 @@ void TestProjectRoundTrip() {
     source.seaLevel = -1;
     source.contourInterval = 2;
     source.elevationView = true;
+    source.terrainDefinitions[2] = {"Deep Woods", {0.05f, 0.22f, 0.08f}};
+    source.terrainDefinitions.push_back({"Tundra", {0.72f, 0.80f, 0.84f}});
     source.terrain[grid_geometry::Pack(-2, 7)] = 4;
+    source.terrain[grid_geometry::Pack(5, 6)] = 8;
     source.elevation[grid_geometry::Pack(-2, 7)] = 3;
     source.fog[grid_geometry::Pack(8, 9)] = 1;
     source.regionsByTile[grid_geometry::Pack(-2, 7)] = 1;
@@ -70,6 +74,10 @@ void TestProjectRoundTrip() {
     Check(LoadProjectDocument(path.string(), loaded, version, error), "project document loads");
     Check(version == kProjectVersion, "project version round-trips");
     Check(loaded.terrain == source.terrain, "terrain layer round-trips");
+    Check(loaded.terrainDefinitions.size() == 9 &&
+              loaded.terrainDefinitions[2].name == "Deep Woods" &&
+              loaded.terrainDefinitions[8].name == "Tundra",
+          "custom terrain definitions round-trip");
     Check(loaded.elevation == source.elevation, "elevation layer round-trips");
     Check(loaded.fog == source.fog, "fog layer round-trips");
     Check(loaded.cities.size() == 1 && loaded.cities[0].name == "Stonehome",
@@ -88,12 +96,43 @@ void TestProjectRoundTrip() {
     std::filesystem::remove(path, ignored);
 }
 
+void TestVersionThreeProjectCompatibility() {
+    std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "map_drawer_version_three.txt";
+    {
+        std::ofstream output(path);
+        output << "MAP_DRAWER_PROJECT 3\n"
+                  "GRID 1\n"
+                  "ELEVATION_SETTINGS 250 0 1 0 1 1\n"
+                  "TERRAIN 1\n0 0 2\n"
+                  "ELEVATION 0\n"
+                  "FOG 0\n"
+                  "REGIONS 0\n"
+                  "REGION_TILES 0\n"
+                  "CITIES 0\n"
+                  "POIS 0\n"
+                  "ROUTES 0\n"
+                  "END\n";
+    }
+    ProjectDocument loaded;
+    int version = 0;
+    std::string error;
+    Check(LoadProjectDocument(path.string(), loaded, version, error),
+          "version-three projects remain loadable");
+    Check(version == 3 && loaded.terrainDefinitions.size() == kTerrainCount,
+          "older projects receive the default terrain palette");
+
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+}
+
 } // namespace
 
 int main() {
     TestGridGeometry();
     TestDomainLookups();
     TestProjectRoundTrip();
+    TestVersionThreeProjectCompatibility();
     if (gFailures != 0) {
         std::cerr << gFailures << " core test(s) failed\n";
         return 1;

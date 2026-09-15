@@ -3,6 +3,7 @@
 #include "grid_geometry.h"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <utility>
@@ -52,6 +53,11 @@ bool SaveProjectDocument(const std::string &path, const ProjectDocument &documen
     output << std::setprecision(17);
     output << "MAP_DRAWER_PROJECT " << kProjectVersion << '\n';
     output << "GRID " << (document.hexGrid ? 1 : 0) << '\n';
+    output << "TERRAIN_TYPES " << document.terrainDefinitions.size() << '\n';
+    for (const TerrainDefinition &terrain : document.terrainDefinitions) {
+        output << terrain.color.r << ' ' << terrain.color.g << ' ' << terrain.color.b << ' '
+               << std::quoted(terrain.name) << '\n';
+    }
     output << "ELEVATION_SETTINGS " << document.metresPerElevationLevel << ' '
            << document.seaLevel << ' ' << document.contourInterval << ' '
            << (document.elevationView ? 1 : 0) << ' ' << (document.showContours ? 1 : 0) << ' '
@@ -127,6 +133,30 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
     }
     loaded.hexGrid = gridValue != 0;
 
+    if (loadedVersion >= 5) {
+        std::size_t terrainTypeCount = 0;
+        if (!ReadSectionCount(input, "TERRAIN_TYPES", terrainTypeCount) || terrainTypeCount == 0 ||
+            terrainTypeCount > kMaxTerrainTypes) {
+            errorMessage = "invalid TERRAIN_TYPES section";
+            return false;
+        }
+        loaded.terrainDefinitions.clear();
+        loaded.terrainDefinitions.reserve(terrainTypeCount);
+        for (std::size_t index = 0; index < terrainTypeCount; ++index) {
+            TerrainDefinition terrain;
+            input >> terrain.color.r >> terrain.color.g >> terrain.color.b >> std::quoted(terrain.name);
+            const auto validColor = [](float value) {
+                return std::isfinite(value) && value >= 0.0f && value <= 1.0f;
+            };
+            if (!input || terrain.name.empty() || !validColor(terrain.color.r) ||
+                !validColor(terrain.color.g) || !validColor(terrain.color.b)) {
+                errorMessage = "invalid terrain definition";
+                return false;
+            }
+            loaded.terrainDefinitions.push_back(std::move(terrain));
+        }
+    }
+
     if (loadedVersion >= 3) {
         int elevationView = 0;
         int contours = 0;
@@ -147,7 +177,8 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
         loaded.showHillshade = hillshade != 0;
     }
 
-    if (!ReadUnsignedTileLayer(input, "TERRAIN", loaded.terrain, kTerrainCount - 1)) {
+    if (!ReadUnsignedTileLayer(input, "TERRAIN", loaded.terrain,
+                               static_cast<int>(loaded.terrainDefinitions.size()) - 1)) {
         errorMessage = "invalid TERRAIN section";
         return false;
     }

@@ -13,6 +13,11 @@ struct Vec3 {
     float b = 0.0f;
 };
 
+struct TerrainDefinition {
+    std::string name;
+    Vec3 color{};
+};
+
 struct Region {
     int id = 0;
     Vec3 color{};
@@ -62,12 +67,15 @@ struct Route {
 enum class PaintMode { Terrain, Region, Elevation, Fog };
 enum class ElevationEditMode { Set, Raise, Lower, Flatten, Smooth };
 enum class ToolMode { Brush, FloodFill, Line, Curve, Polygon, Circle, Scatter, River, TradeRoute, Selection, Measure };
-enum class ModalType { None, Region, City, Poi, Encounter, Route, Info, Confirm, ProjectName, Search };
+enum class ModalType {
+    None, Region, City, Poi, Encounter, TerrainEditor, Route, Info, Confirm, ProjectName, Search
+};
 enum class PlacementMode { None, City, Poi, Encounter };
 enum class ConfirmAction { None, ClearLayer, LoadProject, OverwriteProject, RecoverAutosave, GenerateRelief };
 
 enum class UiAction {
-    None, SetMode, SetTool, SetTerrain, SetElevationValue, SetElevationTool,
+    None, SetMode, SetTool, SetTerrain, EditTerrains, TerrainPagePrevious, TerrainPageNext,
+    SetElevationValue, SetElevationTool,
     ElevationDown, ElevationUp, BrushDown, BrushUp, ToggleShape,
     NewRegion, CycleRegion, NewCity, NewPoi, NewEncounter, DeleteMarker, DeleteRoute, WorldInfo, Help, Find,
     Undo, Redo, Save, Load, Clear, Export, ToggleGrid, ToggleGeometry, ToggleRegions,
@@ -75,7 +83,8 @@ enum class UiAction {
     FogHideAll, FogRevealAll, ResetCamera, FitMap, ProjectName,
     SelectionCopy, SelectionCut, SelectionPaste, SelectionDelete,
     SelectionPaint, SelectionRegion, SelectionElevationDown, SelectionElevationUp, SelectionClear,
-    ModalPrevious, ModalNext, ModalAccept, ModalCancel, ModalPoiKind
+    ModalPrevious, ModalNext, ModalAccept, ModalCancel, ModalPoiKind,
+    ModalTerrainPrevious, ModalTerrainNext, ModalTerrainNew
 };
 
 struct TileChange {
@@ -114,6 +123,8 @@ inline constexpr int kRegionPaletteSize = 10;
 extern const Vec3 kRegionPalette[kRegionPaletteSize];
 extern const Vec3 kTerrainColors[kTerrainCount];
 extern const char *const kTerrainNames[kTerrainCount];
+
+std::vector<TerrainDefinition> DefaultTerrainDefinitions();
 
 const char *PoiKindName(PoiKind kind);
 PoiVisual GetPoiVisual(PoiKind kind);

@@ -42,6 +42,7 @@ namespace {
 // World-space size of the tiny in-map font.
 constexpr float kLabelPixelSize = kTileSize * 0.11f; // world size of one font "pixel"
 constexpr float kLabelGlyphAdvance = kLabelPixelSize * 4.0f; // 3 cols + 1 gap
+constexpr int kTerrainPageSize = 9;
 
 const char *kVertexShaderSource = R"glsl(
 #version 330 core
@@ -87,6 +88,7 @@ void OpenKeybindHelp();
 // Persisted world data lives together; aliases keep the editing code concise while
 // making the ownership boundary explicit for save/load operations.
 ProjectDocument gProjectDocument;
+auto &gTerrainDefinitions = gProjectDocument.terrainDefinitions;
 auto &gMapData = gProjectDocument.terrain;
 auto &gRegionData = gProjectDocument.regionsByTile;
 auto &gElevationData = gProjectDocument.elevation;
@@ -112,6 +114,9 @@ PaintMode gPaintMode = PaintMode::Terrain;
 bool gShowRegions = true;
 bool gShowLabels = true;
 int gBrush = 1;
+int gTerrainPage = 0;
+int gEditingTerrainIndex = 0;
+bool gCreatingTerrain = false;
 int gElevationBrush = 1;
 ElevationEditMode gElevationEditMode = ElevationEditMode::Set;
 bool gFlattenHeightCaptured = false;
@@ -135,6 +140,7 @@ std::vector<UiHit> gUiHits;
 ModalType gModalType = ModalType::None;
 PlacementMode gPlacementMode = PlacementMode::None;
 std::vector<std::string> gModalFields;
+std::string gModalError;
 std::string gInfoTitle;
 std::vector<std::string> gInfoLines;
 ConfirmAction gConfirmAction = ConfirmAction::None;
@@ -753,6 +759,50 @@ void OpenModal(ModalType type, std::vector<std::string> fields) {
     gModalType = type;
     gModalFields = std::move(fields);
     gModalField = 0;
+    gModalError.clear();
+}
+
+int TerrainColorByte(float value) {
+    return static_cast<int>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
+}
+
+void LoadTerrainEditorFields(int terrainIndex) {
+    if (gTerrainDefinitions.empty()) gTerrainDefinitions = DefaultTerrainDefinitions();
+    gEditingTerrainIndex = std::clamp(terrainIndex, 0,
+                                     static_cast<int>(gTerrainDefinitions.size()) - 1);
+    const TerrainDefinition &terrain = gTerrainDefinitions[static_cast<size_t>(gEditingTerrainIndex)];
+    gModalFields = {terrain.name, std::to_string(TerrainColorByte(terrain.color.r)),
+                    std::to_string(TerrainColorByte(terrain.color.g)),
+                    std::to_string(TerrainColorByte(terrain.color.b))};
+    gModalField = 0;
+    gCreatingTerrain = false;
+    gModalError.clear();
+}
+
+void OpenTerrainEditor() {
+    OpenModal(ModalType::TerrainEditor, {});
+    LoadTerrainEditorFields(gBrush);
+}
+
+void StartNewTerrain() {
+    if (gTerrainDefinitions.size() >= kMaxTerrainTypes) {
+        LOG_WARN("Terrain limit reached (%d)", kMaxTerrainTypes);
+        return;
+    }
+    gEditingTerrainIndex = static_cast<int>(gTerrainDefinitions.size());
+    gModalFields = {"New Terrain", "128", "128", "128"};
+    gModalField = 0;
+    gCreatingTerrain = true;
+    gModalError.clear();
+}
+
+bool ParseColorChannel(const std::string &text, int &value) {
+    if (text.empty()) return false;
+    char *end = nullptr;
+    long parsed = std::strtol(text.c_str(), &end, 10);
+    if (end == text.c_str() || *end != '\0' || parsed < 0 || parsed > 255) return false;
+    value = static_cast<int>(parsed);
+    return true;
 }
 
 void OpenConfirmation(ConfirmAction action, const std::string &title,
@@ -776,6 +826,8 @@ void OpenKeybindHelp() {
         "LEFT CLICK/DRAG   USE THE ACTIVE TOOL",
         "RIGHT CLICK/DRAG  ERASE OR FINISH A PATH",
         "SHIFT + DRAG      FILL OR ERASE A RECTANGLE",
+        "0-9               SELECT THE FIRST TEN TERRAIN TYPES",
+        "TERRAIN < >       CHANGE PALETTE PAGE   EDIT / NEW MANAGE TYPES",
         "[ / ]             DECREASE / INCREASE BRUSH SIZE",
         "H                 TOGGLE ROUND / BLOCK BRUSH",
         "T                 CYCLE TERRAIN / REGION / HEIGHT / FOG",
@@ -1068,6 +1120,50 @@ void CloseModal(bool accept) {
         UpdateWindowTitle();
         return;
     }
+    if (gModalType == ModalType::TerrainEditor) {
+        if (!accept) {
+            gModalType = ModalType::None;
+            gModalFields.clear();
+            gModalError.clear();
+            gCreatingTerrain = false;
+            UpdateWindowTitle();
+            return;
+        }
+        int red = 0, green = 0, blue = 0;
+        if (gModalFields.size() != 4 || gModalFields[0].empty() ||
+            !ParseColorChannel(gModalFields[1], red) ||
+            !ParseColorChannel(gModalFields[2], green) ||
+            !ParseColorChannel(gModalFields[3], blue)) {
+            LOG_WARN("Terrain name is required and RGB values must be whole numbers from 0 to 255");
+            gModalError = "NAME REQUIRED; RGB VALUES MUST BE 0-255";
+            return;
+        }
+        TerrainDefinition terrain{
+            gModalFields[0],
+            {red / 255.0f, green / 255.0f, blue / 255.0f},
+        };
+        if (gCreatingTerrain) {
+            gTerrainDefinitions.push_back(std::move(terrain));
+            gEditingTerrainIndex = static_cast<int>(gTerrainDefinitions.size()) - 1;
+            LOG_INFO("Created terrain #%d '%s'", gEditingTerrainIndex,
+                     gTerrainDefinitions.back().name.c_str());
+        } else {
+            gTerrainDefinitions[static_cast<size_t>(gEditingTerrainIndex)] = std::move(terrain);
+            LOG_INFO("Updated terrain #%d '%s'", gEditingTerrainIndex,
+                     gTerrainDefinitions[static_cast<size_t>(gEditingTerrainIndex)].name.c_str());
+        }
+        gBrush = gEditingTerrainIndex;
+        gTerrainPage = gBrush / kTerrainPageSize;
+        gPaintMode = PaintMode::Terrain;
+        gModalType = ModalType::None;
+        gModalFields.clear();
+        gModalError.clear();
+        gCreatingTerrain = false;
+        ++gSceneRevision;
+        MarkProjectDirty();
+        UpdateWindowTitle();
+        return;
+    }
     if (accept) {
         if (gModalType == ModalType::Region) {
             int id = gNextRegionId++;
@@ -1130,6 +1226,7 @@ void CloseModal(bool accept) {
     }
     gModalType = ModalType::None;
     gModalFields.clear();
+    gModalError.clear();
     gInfoTitle.clear();
     gInfoLines.clear();
     gModalField = 0;
@@ -1287,7 +1384,8 @@ void UpdateWindowTitle() {
     const char *modeLabel = PaintModeName(gPaintMode);
     char paintInfo[96];
     if (gPaintMode == PaintMode::Terrain)
-        std::snprintf(paintInfo, sizeof(paintInfo), "%s", kTerrainNames[gBrush]);
+        std::snprintf(paintInfo, sizeof(paintInfo), "%s",
+                      gTerrainDefinitions[static_cast<size_t>(gBrush)].name.c_str());
     else if (gPaintMode == PaintMode::Elevation)
         std::snprintf(paintInfo, sizeof(paintInfo), "%s %+d (%+d m)",
                       ElevationEditModeName(gElevationEditMode), gElevationBrush,
@@ -1640,6 +1738,9 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
         gElevationView = false;
         gShowElevationContours = true;
         gShowHillshade = true;
+        gTerrainDefinitions = DefaultTerrainDefinitions();
+        gBrush = std::clamp(gBrush, 0, static_cast<int>(gTerrainDefinitions.size()) - 1);
+        gTerrainPage = gBrush / kTerrainPageSize;
         gElevationEditMode = ElevationEditMode::Set;
         LoadMap();
         LoadElevation();
@@ -1672,6 +1773,8 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
         return false;
     }
     gProjectDocument = std::move(loadedDocument);
+    gBrush = std::clamp(gBrush, 0, static_cast<int>(gTerrainDefinitions.size()) - 1);
+    gTerrainPage = gBrush / kTerrainPageSize;
     gElevationEditMode = ElevationEditMode::Set;
     gNextRegionId = 1;
     for (const auto &[regionId, region] : gRegions) {
@@ -1756,7 +1859,8 @@ void GenerateTerrainRelief() {
     BeginStroke(gMapData.size(), 1);
     for (const auto &entry : gMapData) {
         auto [col, row] = TileCoords(entry.first);
-        SetTileRecorded(col, row, terrainHeights[entry.second]);
+        int height = entry.second < kTerrainCount ? terrainHeights[entry.second] : 0;
+        SetTileRecorded(col, row, height);
     }
     EndStroke();
     gPaintMode = previousPaintMode;
@@ -2051,13 +2155,29 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
         AppendUiText(vertices, std::to_string(gMetresPerElevationLevel) + " M / LEVEL",
                      x0 + 90.0f, 323.0f, 1.4f, {0.72f, 0.77f, 0.84f}, 24);
     } else {
-        for (int i = 0; i < kTerrainCount; ++i) {
-            float x = x0 + (i % 2) * 124.0f;
-            float y = 232.0f + (i / 2) * 28.0f;
-            AddUiButton(vertices, x, y, 119.0f, h, kTerrainNames[i], UiAction::SetTerrain, i,
-                        gBrush == i);
-            AppendUiRect(vertices, x + 105.0f, y + 7.0f, 8.0f, 10.0f, kTerrainColors[i]);
+        int pageCount = std::max(1, (static_cast<int>(gTerrainDefinitions.size()) +
+                                     kTerrainPageSize - 1) /
+                                        kTerrainPageSize);
+        gTerrainPage = std::clamp(gTerrainPage, 0, pageCount - 1);
+        int firstTerrain = gTerrainPage * kTerrainPageSize;
+        for (int slot = 0; slot < kTerrainPageSize; ++slot) {
+            int terrainIndex = firstTerrain + slot;
+            if (terrainIndex >= static_cast<int>(gTerrainDefinitions.size())) break;
+            float x = x0 + (slot % 3) * 83.0f;
+            float y = 232.0f + (slot / 3) * 28.0f;
+            const TerrainDefinition &terrain =
+                gTerrainDefinitions[static_cast<size_t>(terrainIndex)];
+            std::string label = terrain.name.substr(0, 8);
+            AddUiButton(vertices, x, y, 78.0f, h, label, UiAction::SetTerrain, terrainIndex,
+                        gBrush == terrainIndex);
+            AppendUiRect(vertices, x + 67.0f, y + 7.0f, 7.0f, 10.0f, terrain.color);
         }
+        AddUiButton(vertices, x0, 316.0f, 31.0f, h, "<", UiAction::TerrainPagePrevious);
+        AddUiButton(vertices, x0 + 36.0f, 316.0f, 31.0f, h, ">", UiAction::TerrainPageNext);
+        AppendUiText(vertices, std::to_string(gTerrainPage + 1) + "/" + std::to_string(pageCount),
+                     x0 + 74.0f, 323.0f, 1.4f, {0.72f, 0.77f, 0.84f}, 8);
+        AddUiButton(vertices, x0 + 126.0f, 316.0f, 54.0f, h, "EDIT", UiAction::EditTerrains);
+        AddUiButton(vertices, x0 + 185.0f, 316.0f, 59.0f, h, "NEW", UiAction::EditTerrains, 1);
     }
 
     headingText("BRUSH", 350.0f);
@@ -2220,9 +2340,11 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                                : 560.0f;
         float mh = keybindHelp
                        ? std::min(760.0f, static_cast<float>(gWindowHeight) - 60.0f)
+                       : (gModalType == ModalType::TerrainEditor
+                              ? 420.0f
                        : ((gModalType == ModalType::Info || gModalType == ModalType::Confirm)
                               ? 320.0f
-                              : (gModalFields.size() > 1 ? 290.0f : 220.0f));
+                              : (gModalFields.size() > 1 ? 290.0f : 220.0f)));
         float mx = (gWindowWidth - mw) * 0.5f, my = (gWindowHeight - mh) * 0.5f;
         AppendUiRect(vertices, mx, my, mw, mh, {0.10f, 0.12f, 0.16f});
         AppendUiRect(vertices, mx, my, mw, 4.0f, {0.75f, 0.57f, 0.20f});
@@ -2231,6 +2353,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                             gModalType == ModalType::Poi ? "NEW POINT OF INTEREST" :
                             gModalType == ModalType::Encounter
                                 ? (gEditingEncounterIndex >= 0 ? "EDIT ENCOUNTER" : "NEW ENCOUNTER") :
+                            gModalType == ModalType::TerrainEditor ? "TERRAIN EDITOR" :
                             gModalType == ModalType::Info ? gInfoTitle.c_str() :
                             gModalType == ModalType::Confirm ? gInfoTitle.c_str() :
                             gModalType == ModalType::ProjectName ? "PROJECT FILE" :
@@ -2241,7 +2364,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
             AppendUiText(vertices, "TILE " + std::to_string(gModalCol) + " " + std::to_string(gModalRow),
                          mx + 350.0f, my + 29.0f, 1.5f, {0.72f, 0.77f, 0.84f}, 24);
         if (gModalType == ModalType::Info) {
-            const float lineSpacing = keybindHelp ? 22.0f : 34.0f;
+            const float lineSpacing = keybindHelp ? 20.0f : 34.0f;
             for (size_t i = 0; i < gInfoLines.size(); ++i) {
                 const bool sectionHeading =
                     keybindHelp && (gInfoLines[i] == "NAVIGATION" || gInfoLines[i] == "PAINTING" ||
@@ -2266,7 +2389,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
             AddUiButton(vertices, mx + mw - 112.0f, my + mh - 48.0f, 88.0f, 28.0f,
                         "CONFIRM", UiAction::ModalAccept);
         } else {
-            const char *fieldLabels[2] = {"NAME", "DETAILS"};
+            const char *fieldLabels[4] = {"NAME", "DETAILS", "", ""};
             if (gModalType == ModalType::Search) fieldLabels[0] = "SEARCH";
             if (gModalType == ModalType::Region || gModalType == ModalType::City) fieldLabels[1] = "RULER";
             if (gModalType == ModalType::Poi) {
@@ -2277,7 +2400,38 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                                 static_cast<int>(gModalPoiKind) == i);
                 }
             }
-            float fieldsY = my + (gModalType == ModalType::Poi ? 98.0f : 62.0f);
+            if (gModalType == ModalType::TerrainEditor) {
+                fieldLabels[1] = "RED 0-255";
+                fieldLabels[2] = "GREEN 0-255";
+                fieldLabels[3] = "BLUE 0-255";
+                AddUiButton(vertices, mx + 24.0f, my + 58.0f, 76.0f, 28.0f, "PREV",
+                            UiAction::ModalTerrainPrevious);
+                AddUiButton(vertices, mx + 106.0f, my + 58.0f, 76.0f, 28.0f, "NEXT",
+                            UiAction::ModalTerrainNext);
+                AddUiButton(vertices, mx + 188.0f, my + 58.0f, 76.0f, 28.0f, "NEW",
+                            UiAction::ModalTerrainNew);
+                std::string terrainPosition = gCreatingTerrain
+                                                  ? "NEW TERRAIN"
+                                                  : "TERRAIN " + std::to_string(gEditingTerrainIndex + 1) +
+                                                        " OF " + std::to_string(gTerrainDefinitions.size());
+                AppendUiText(vertices, terrainPosition, mx + 286.0f, my + 67.0f, 1.5f,
+                             {0.72f, 0.77f, 0.84f}, 30);
+                int previewRed = 0, previewGreen = 0, previewBlue = 0;
+                if (gModalFields.size() == 4 &&
+                    ParseColorChannel(gModalFields[1], previewRed) &&
+                    ParseColorChannel(gModalFields[2], previewGreen) &&
+                    ParseColorChannel(gModalFields[3], previewBlue)) {
+                    AppendUiRect(vertices, mx + mw - 56.0f, my + 56.0f, 34.0f, 32.0f,
+                                 {0.04f, 0.04f, 0.05f});
+                    AppendUiRect(vertices, mx + mw - 52.0f, my + 60.0f, 26.0f, 24.0f,
+                                 {previewRed / 255.0f, previewGreen / 255.0f,
+                                  previewBlue / 255.0f});
+                }
+            }
+            float fieldsY = my + ((gModalType == ModalType::Poi ||
+                                   gModalType == ModalType::TerrainEditor)
+                                      ? 98.0f
+                                      : 62.0f);
             for (size_t i = 0; i < gModalFields.size(); ++i) {
                 float fy = fieldsY + static_cast<float>(i) * 62.0f;
                 AppendUiText(vertices, fieldLabels[i], mx + 24.0f, fy, 1.5f, heading);
@@ -2294,10 +2448,14 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                                    static_cast<int>(i)});
             }
             float buttonY = my + mh - 48.0f;
+            if (!gModalError.empty())
+                AppendUiText(vertices, gModalError, mx + 24.0f, buttonY - 23.0f, 1.4f,
+                             {0.95f, 0.38f, 0.28f}, 64);
             AddUiButton(vertices, mx + mw - 210.0f, buttonY, 86.0f, 28.0f, "CANCEL", UiAction::ModalCancel);
             AddUiButton(vertices, mx + mw - 112.0f, buttonY, 88.0f, 28.0f,
                         gModalType == ModalType::ProjectName ? "APPLY" :
                         gModalType == ModalType::Search ? "FIND" :
+                        gModalType == ModalType::TerrainEditor ? (gCreatingTerrain ? "CREATE" : "SAVE") :
                         (gModalType == ModalType::Encounter && gEditingEncounterIndex >= 0)
                             ? "SAVE" : "CREATE",
                         UiAction::ModalAccept);
@@ -2318,7 +2476,29 @@ void HandleUiAction(const UiHit &hit) {
         case UiAction::None: break;
         case UiAction::SetMode: gPaintMode = static_cast<PaintMode>(hit.value); break;
         case UiAction::SetTool: SelectTool(static_cast<ToolMode>(hit.value)); break;
-        case UiAction::SetTerrain: gBrush = hit.value; gPaintMode = PaintMode::Terrain; break;
+        case UiAction::SetTerrain:
+            gBrush = std::clamp(hit.value, 0, static_cast<int>(gTerrainDefinitions.size()) - 1);
+            gTerrainPage = gBrush / kTerrainPageSize;
+            gPaintMode = PaintMode::Terrain;
+            break;
+        case UiAction::EditTerrains:
+            OpenTerrainEditor();
+            if (hit.value != 0) StartNewTerrain();
+            break;
+        case UiAction::TerrainPagePrevious: {
+            int pageCount = std::max(1, (static_cast<int>(gTerrainDefinitions.size()) +
+                                         kTerrainPageSize - 1) /
+                                            kTerrainPageSize);
+            gTerrainPage = (gTerrainPage + pageCount - 1) % pageCount;
+            break;
+        }
+        case UiAction::TerrainPageNext: {
+            int pageCount = std::max(1, (static_cast<int>(gTerrainDefinitions.size()) +
+                                         kTerrainPageSize - 1) /
+                                            kTerrainPageSize);
+            gTerrainPage = (gTerrainPage + 1) % pageCount;
+            break;
+        }
         case UiAction::SetElevationValue:
             gElevationBrush = std::clamp(hit.value, kMinElevation, kMaxElevation);
             gElevationEditMode = ElevationEditMode::Set;
@@ -2406,6 +2586,15 @@ void HandleUiAction(const UiHit &hit) {
         case UiAction::ModalCancel: CloseModal(false); break;
         case UiAction::ModalPoiKind:
             gModalPoiKind = static_cast<PoiKind>(std::clamp(hit.value, 0, kPoiKindCount - 1)); break;
+        case UiAction::ModalTerrainPrevious:
+            LoadTerrainEditorFields((gCreatingTerrain ? static_cast<int>(gTerrainDefinitions.size())
+                                                      : gEditingTerrainIndex) -
+                                    1);
+            break;
+        case UiAction::ModalTerrainNext:
+            LoadTerrainEditorFields((gCreatingTerrain ? -1 : gEditingTerrainIndex) + 1);
+            break;
+        case UiAction::ModalTerrainNew: StartNewTerrain(); break;
     }
     gUseUiTarget = false;
     UpdateWindowTitle();
@@ -2435,9 +2624,16 @@ bool CursorOverGui() {
 
 void CharacterCallback(GLFWwindow * /*window*/, unsigned int codepoint) {
     if (gModalType == ModalType::None || gModalFields.empty()) return;
-    const size_t limit = gModalType == ModalType::Encounter && gModalField == 1 ? 240 : 80;
-    if (codepoint >= 32 && codepoint <= 126 && gModalFields[gModalField].size() < limit)
+    if (gModalType == ModalType::TerrainEditor && gModalField > 0 &&
+        (codepoint < '0' || codepoint > '9'))
+        return;
+    size_t limit = 80;
+    if (gModalType == ModalType::Encounter && gModalField == 1) limit = 240;
+    else if (gModalType == ModalType::TerrainEditor && gModalField > 0) limit = 3;
+    if (codepoint >= 32 && codepoint <= 126 && gModalFields[gModalField].size() < limit) {
         gModalFields[gModalField].push_back(static_cast<char>(codepoint));
+        gModalError.clear();
+    }
 }
 
 void MouseButtonCallback(GLFWwindow * /*window*/, int button, int action, int mods) {
@@ -2713,9 +2909,10 @@ void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int 
             return;
         }
         if (key == GLFW_KEY_ESCAPE) CloseModal(false);
-        else if (key == GLFW_KEY_BACKSPACE && !gModalFields.empty() && !gModalFields[gModalField].empty())
+        else if (key == GLFW_KEY_BACKSPACE && !gModalFields.empty() && !gModalFields[gModalField].empty()) {
             gModalFields[gModalField].pop_back();
-        else if (key == GLFW_KEY_TAB && !gModalFields.empty())
+            gModalError.clear();
+        } else if (key == GLFW_KEY_TAB && !gModalFields.empty())
             gModalField = (gModalField + 1) % static_cast<int>(gModalFields.size());
         else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
             if (gModalField + 1 < static_cast<int>(gModalFields.size())) ++gModalField;
@@ -2750,8 +2947,11 @@ void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int 
         gMeasureStage = 0;
     } else if (key == GLFW_KEY_ESCAPE) {
         glfwSetWindowShouldClose(window, GLFW_TRUE);
-    } else if (key >= GLFW_KEY_0 && key <= GLFW_KEY_7) {
+    } else if (key >= GLFW_KEY_0 && key <= GLFW_KEY_9 &&
+               key - GLFW_KEY_0 < static_cast<int>(gTerrainDefinitions.size())) {
         gBrush = key - GLFW_KEY_0;
+        gTerrainPage = gBrush / kTerrainPageSize;
+        gPaintMode = PaintMode::Terrain;
         UpdateWindowTitle();
     } else if (key == GLFW_KEY_G) {
         gShowGrid = !gShowGrid;
@@ -2991,7 +3191,9 @@ void RebuildVisibleTileMesh(GLuint vbo, GLsizei &outVertexCount) {
     vertices.reserve(std::min(gMapData.size(), static_cast<size_t>(32768)) * floatsPerTile);
     auto appendElevationTile = [&](int32_t col, int32_t row, uint8_t terrain) {
         int elevation = GetLayerValue(PaintMode::Elevation, TileKey(col, row));
-        Vec3 baseColor = gElevationView ? ElevationBandColor(elevation) : kTerrainColors[terrain];
+        size_t terrainIndex = std::min(static_cast<size_t>(terrain), gTerrainDefinitions.size() - 1);
+        Vec3 baseColor = gElevationView ? ElevationBandColor(elevation)
+                                        : gTerrainDefinitions[terrainIndex].color;
         float levelBrightness = gElevationView ? 1.0f : 1.0f + static_cast<float>(elevation) * 0.075f;
         float shade = ElevationHillshade(col, row);
         Vec3 color{std::clamp(baseColor.r * levelBrightness * shade, 0.0f, 1.0f),
@@ -3703,8 +3905,8 @@ int main() {
     LOG_INFO("  I                 : print region/city/POI/route info to the console/log");
     LOG_INFO("  [ / ]             : shrink / grow brush size");
     LOG_INFO("  Ctrl+Z / Ctrl+Y   : undo / redo");
-    LOG_INFO("  Keys 0-7          : select terrain brush (0=Empty 1=Plains 2=Forest 3=Water");
-    LOG_INFO("                      4=Mountain 5=Desert 6=Hills 7=Road)");
+    LOG_INFO("  Keys 0-9          : select one of the first ten terrain brushes");
+    LOG_INFO("  Terrain EDIT/NEW  : rename, recolor, or create project terrain types");
     LOG_INFO("  WASD / Arrows     : pan the camera");
     LOG_INFO("  Mouse wheel       : zoom in/out (centered on cursor)");
     LOG_INFO("  R                 : reset camera/zoom");

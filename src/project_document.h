@@ -8,6 +8,7 @@
 #include <vector>
 
 struct ProjectDocument {
+    std::vector<TerrainDefinition> terrainDefinitions = DefaultTerrainDefinitions();
     std::unordered_map<uint64_t, uint8_t> terrain;
     std::unordered_map<uint64_t, int8_t> elevation;
     std::unordered_map<uint64_t, uint8_t> regionsByTile;

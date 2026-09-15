@@ -19,6 +19,14 @@ const char *const kTerrainNames[kTerrainCount] = {
     "Empty", "Plains", "Forest", "Water", "Mountain", "Desert", "Hills", "Road",
 };
 
+std::vector<TerrainDefinition> DefaultTerrainDefinitions() {
+    std::vector<TerrainDefinition> definitions;
+    definitions.reserve(kTerrainCount);
+    for (int index = 0; index < kTerrainCount; ++index)
+        definitions.push_back({kTerrainNames[index], kTerrainColors[index]});
+    return definitions;
+}
+
 const char *PoiKindName(PoiKind kind) {
     switch (kind) {
         case PoiKind::Dungeon: return "Dungeon";
@@ -101,4 +109,3 @@ const char *ToolName(ToolMode mode) {
     }
     return "?";
 }
-
