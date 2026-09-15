@@ -38,6 +38,13 @@ struct PointOfInterest {
     std::string description;
 };
 
+struct Encounter {
+    int32_t col = 0;
+    int32_t row = 0;
+    std::string name;
+    std::string description;
+};
+
 struct PoiVisual {
     int sides = 4;
     float rotation = 0.0f;
@@ -55,14 +62,14 @@ struct Route {
 enum class PaintMode { Terrain, Region, Elevation, Fog };
 enum class ElevationEditMode { Set, Raise, Lower, Flatten, Smooth };
 enum class ToolMode { Brush, FloodFill, Line, Curve, Polygon, Circle, Scatter, River, TradeRoute, Selection, Measure };
-enum class ModalType { None, Region, City, Poi, Route, Info, Confirm, ProjectName, Search };
-enum class PlacementMode { None, City, Poi };
+enum class ModalType { None, Region, City, Poi, Encounter, Route, Info, Confirm, ProjectName, Search };
+enum class PlacementMode { None, City, Poi, Encounter };
 enum class ConfirmAction { None, ClearLayer, LoadProject, OverwriteProject, RecoverAutosave, GenerateRelief };
 
 enum class UiAction {
     None, SetMode, SetTool, SetTerrain, SetElevationValue, SetElevationTool,
     ElevationDown, ElevationUp, BrushDown, BrushUp, ToggleShape,
-    NewRegion, CycleRegion, NewCity, NewPoi, DeleteMarker, DeleteRoute, WorldInfo, Help, Find, RollEncounter,
+    NewRegion, CycleRegion, NewCity, NewPoi, NewEncounter, DeleteMarker, DeleteRoute, WorldInfo, Help, Find,
     Undo, Redo, Save, Load, Clear, Export, ToggleGrid, ToggleGeometry, ToggleRegions,
     ToggleLabels, TogglePlayerView, ToggleElevationView, ToggleContours, ToggleHillshade, GenerateRelief,
     FogHideAll, FogRevealAll, ResetCamera, FitMap, ProjectName,

@@ -15,6 +15,7 @@ struct ProjectDocument {
     std::unordered_map<int, Region> regions;
     std::vector<City> cities;
     std::vector<PointOfInterest> pointsOfInterest;
+    std::vector<Encounter> encounters;
     std::vector<Route> routes;
 
     bool hexGrid = true;
@@ -30,4 +31,3 @@ bool SaveProjectDocument(const std::string &path, const ProjectDocument &documen
                          std::string &errorMessage);
 bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
                          int &loadedVersion, std::string &errorMessage);
-

@@ -2,7 +2,8 @@
 
 Map Drawer is a C++17/OpenGL overworld editor for tabletop campaigns. It supports sparse square
 and hex maps, terrain and elevation painting, regions, fog of war, cities, points of interest,
-routes, selection tools, autosave, backups, and versioned project files.
+editable DM encounter markers, routes, selection tools, autosave, backups, and versioned project
+files.
 
 ## Build
 
@@ -35,4 +36,3 @@ remain transient and are reset explicitly after a successful load.
 
 Grid geometry is stateless and takes the grid type as an argument. This keeps square/hex math
 independent from GLFW and OpenGL and allows it to be covered by the core test executable.
-

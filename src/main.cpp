@@ -94,6 +94,7 @@ auto &gFogData = gProjectDocument.fog;
 auto &gRegions = gProjectDocument.regions;
 auto &gCities = gProjectDocument.cities;
 auto &gPois = gProjectDocument.pointsOfInterest;
+auto &gEncounters = gProjectDocument.encounters;
 auto &gRoutes = gProjectDocument.routes;
 bool &gHexGrid = gProjectDocument.hexGrid;
 int &gMetresPerElevationLevel = gProjectDocument.metresPerElevationLevel;
@@ -143,6 +144,7 @@ int gModalField = 0;
 int32_t gModalCol = 0, gModalRow = 0;
 PoiKind gModalPoiKind = PoiKind::Landmark;
 RouteKind gModalRouteKind = RouteKind::River;
+int gEditingEncounterIndex = -1;
 double gLastCanvasWorldX = 0.0, gLastCanvasWorldY = 0.0;
 bool gUseUiTarget = false;
 uint64_t gSceneRevision = 1;
@@ -284,6 +286,10 @@ void FitMapToWindow() {
     }
     for (const auto &poi : gPois) {
         auto [x, y] = TileCenterWorld(poi.col, poi.row);
+        includePoint(x, y, kTileSize * 0.5, kTileSize * 0.5);
+    }
+    for (const auto &encounter : gEncounters) {
+        auto [x, y] = TileCenterWorld(encounter.col, encounter.row);
         includePoint(x, y, kTileSize * 0.5, kTileSize * 0.5);
     }
     for (const auto &route : gRoutes)
@@ -782,7 +788,8 @@ void OpenKeybindHelp() {
         "WORLD AND PROJECT",
         "M CITY   K POI   N NEW REGION   TAB CYCLE REGION",
         "V REGIONS   L LABELS   G GRID   Y HEX / SQUARE",
-        "CTRL+F FIND   CTRL+E ENCOUNTER   I WORLD INFO",
+        "CTRL+F FIND   CTRL+E PLACE ENCOUNTER   I WORLD INFO",
+        "CLICK AN ENCOUNTER MARKER TO EDIT ITS DETAILS",
         "DELETE MARKER/SELECTION   X DELETE ROUTE",
         "CTRL+C/X/V COPY / CUT / PASTE SELECTION",
         "CTRL+Z/Y UNDO / REDO   C CLEAR ACTIVE LAYER",
@@ -876,6 +883,22 @@ void PlacePoiAtCursor() {
     OpenModal(ModalType::Poi, {"", ""});
 }
 
+// Opens an in-window form for a persistent DM encounter at the cursor.
+void PlaceEncounterAtCursor() {
+    std::tie(gModalCol, gModalRow) = CursorTile();
+    gEditingEncounterIndex = -1;
+    OpenModal(ModalType::Encounter, {"", ""});
+}
+
+void EditEncounter(size_t index) {
+    if (index >= gEncounters.size()) return;
+    const Encounter &encounter = gEncounters[index];
+    gModalCol = encounter.col;
+    gModalRow = encounter.row;
+    gEditingEncounterIndex = static_cast<int>(index);
+    OpenModal(ModalType::Encounter, {encounter.name, encounter.description});
+}
+
 bool ShowMarkerInfoAtTile(int32_t col, int32_t row) {
     if (gPlayerView && gFogData.count(TileKey(col, row)) != 0) return false;
     auto cityIt = std::find_if(gCities.begin(), gCities.end(),
@@ -900,6 +923,15 @@ bool ShowMarkerInfoAtTile(int32_t col, int32_t row) {
         gInfoLines.push_back("TILE: " + std::to_string(col) + " " + std::to_string(row));
         OpenModal(ModalType::Info, {});
         return true;
+    }
+    if (!gPlayerView) {
+        auto encounterIt = std::find_if(
+            gEncounters.begin(), gEncounters.end(),
+            [&](const Encounter &encounter) { return encounter.col == col && encounter.row == row; });
+        if (encounterIt != gEncounters.end()) {
+            EditEncounter(static_cast<size_t>(encounterIt - gEncounters.begin()));
+            return true;
+        }
     }
     return false;
 }
@@ -935,6 +967,13 @@ void RunWorldSearch(const std::string &query) {
             auto [x, y] = TileCenterWorld(poi.col, poi.row);
             gSearchMatches.push_back({std::string(PoiKindName(poi.kind)) + ": " + poi.name, x, y});
         }
+        if (!gPlayerView) {
+            for (const Encounter &encounter : gEncounters) {
+                if (!matches(encounter.name) && !matches(encounter.description)) continue;
+                auto [x, y] = TileCenterWorld(encounter.col, encounter.row);
+                gSearchMatches.push_back({"ENCOUNTER: " + encounter.name, x, y});
+            }
+        }
         for (const auto &regionEntry : gRegions) {
             const Region &region = regionEntry.second;
             if (!matches(region.name) && !matches(region.ruler)) continue;
@@ -967,7 +1006,7 @@ void RunWorldSearch(const std::string &query) {
 
     if (gSearchMatches.empty()) {
         gLastFoundLabel = "NO MATCH FOR: " + query;
-        LOG_WARN("No city, POI, region or route matches '%s'", query.c_str());
+        LOG_WARN("No city, POI, encounter, region or route matches '%s'", query.c_str());
         return;
     }
     const SearchResult &result = gSearchMatches[gSearchMatchIndex];
@@ -1058,6 +1097,23 @@ void CloseModal(bool accept) {
             poi.description = gModalFields[1];
             gPois.push_back(poi);
             LOG_INFO("%s '%s' placed at (%d, %d)", PoiKindName(poi.kind), poi.name.c_str(), poi.col, poi.row);
+        } else if (gModalType == ModalType::Encounter) {
+            Encounter encounter;
+            encounter.col = gModalCol;
+            encounter.row = gModalRow;
+            encounter.name = gModalFields[0].empty() ? "Encounter" : gModalFields[0];
+            encounter.description = gModalFields[1];
+            if (gEditingEncounterIndex >= 0 &&
+                gEditingEncounterIndex < static_cast<int>(gEncounters.size())) {
+                gEncounters[static_cast<size_t>(gEditingEncounterIndex)] = std::move(encounter);
+                LOG_INFO("Encounter '%s' updated at (%d, %d)",
+                         gEncounters[static_cast<size_t>(gEditingEncounterIndex)].name.c_str(),
+                         gModalCol, gModalRow);
+            } else {
+                gEncounters.push_back(std::move(encounter));
+                LOG_INFO("Encounter '%s' placed at (%d, %d)", gEncounters.back().name.c_str(),
+                         gModalCol, gModalRow);
+            }
         } else if (gModalType == ModalType::Route) {
             Route route;
             route.kind = gModalRouteKind;
@@ -1077,25 +1133,11 @@ void CloseModal(bool accept) {
     gInfoTitle.clear();
     gInfoLines.clear();
     gModalField = 0;
+    gEditingEncounterIndex = -1;
     UpdateWindowTitle();
 }
 
-// Removes the point of interest at the cursor tile, if any.
-void RemovePoiAtCursor() {
-    auto [col, row] = CursorTile();
-    auto it = std::find_if(gPois.begin(), gPois.end(),
-                           [&](const PointOfInterest &p) { return p.col == col && p.row == row; });
-    if (it == gPois.end()) {
-        LOG_WARN("No point of interest at (%d, %d)", col, row);
-        return;
-    }
-    LOG_INFO("Removed %s '%s'", PoiKindName(it->kind), it->name.c_str());
-    gPois.erase(it);
-    ++gSceneRevision;
-    MarkProjectDirty();
-}
-
-// Removes whatever marker (city takes priority, then point of interest) sits at the cursor tile.
+// Removes whichever world marker sits at the cursor tile.
 void RemoveMarkerAtCursor() {
     auto [col, row] = CursorTile();
     auto cityIt = std::find_if(gCities.begin(), gCities.end(),
@@ -1107,7 +1149,29 @@ void RemoveMarkerAtCursor() {
         MarkProjectDirty();
         return;
     }
-    RemovePoiAtCursor();
+    auto poiIt = std::find_if(gPois.begin(), gPois.end(),
+                              [&](const PointOfInterest &poi) {
+                                  return poi.col == col && poi.row == row;
+                              });
+    if (poiIt != gPois.end()) {
+        LOG_INFO("Removed %s '%s'", PoiKindName(poiIt->kind), poiIt->name.c_str());
+        gPois.erase(poiIt);
+        ++gSceneRevision;
+        MarkProjectDirty();
+        return;
+    }
+    auto encounterIt = std::find_if(gEncounters.begin(), gEncounters.end(),
+                                     [&](const Encounter &encounter) {
+                                         return encounter.col == col && encounter.row == row;
+                                     });
+    if (encounterIt != gEncounters.end()) {
+        LOG_INFO("Removed encounter '%s'", encounterIt->name.c_str());
+        gEncounters.erase(encounterIt);
+        ++gSceneRevision;
+        MarkProjectDirty();
+        return;
+    }
+    LOG_WARN("No city, point of interest, or encounter at (%d, %d)", col, row);
 }
 
 // Prints a summary of all regions, cities, and points of interest to the console/log.
@@ -1135,6 +1199,11 @@ void PrintWorldInfo() {
         LOG_INFO("  [%s] '%s' at (%d, %d)%s%s", PoiKindName(poi.kind), poi.name.c_str(), poi.col, poi.row,
                   poi.description.empty() ? "" : " - ", poi.description.c_str());
     }
+    LOG_INFO("--- Encounters (%zu) ---", gEncounters.size());
+    for (const auto &encounter : gEncounters) {
+        LOG_INFO("  '%s' at (%d, %d)%s%s", encounter.name.c_str(), encounter.col, encounter.row,
+                 encounter.description.empty() ? "" : " - ", encounter.description.c_str());
+    }
     LOG_INFO("--- Routes (%zu) ---", gRoutes.size());
     for (const auto &route : gRoutes) {
         double length = 0.0;
@@ -1149,59 +1218,11 @@ void PrintWorldInfo() {
              gPlayerView ? "on" : "off");
 }
 
-void RollEncounterAtCursor() {
-    static constexpr std::array<std::array<const char *, 6>, kTerrainCount> encounters{{
-        {{"Lost travellers seek the nearest safe road", "A merchant cart has broken an axle",
-          "Scouts from two rival factions watch each other", "An unnatural silence settles over the area",
-          "A weathered shrine contains a recent offering", "Fresh tracks cross the party's route"}},
-        {{"Mounted bandits demand a road toll", "A displaced farming family needs protection",
-          "A territorial herd blocks the route", "Couriers race past with urgent news",
-          "A patrol questions everyone entering the region", "A sinkhole exposes an older buried road"}},
-        {{"Hunters are pursued by something unseen", "Webs cover a path that was clear yesterday",
-          "Fey lights lead away from the trail", "Woodcutters have disturbed an ancient marker",
-          "A wounded beast guards its hidden den", "Masked scouts signal from the canopy"}},
-        {{"A damaged ferry drifts without its crew", "River raiders emerge from a concealed inlet",
-          "A sudden current carries strange wreckage", "Fisherfolk haul up an enchanted object",
-          "A territorial creature circles beneath the water", "Floodwater reveals a submerged ruin"}},
-        {{"Rockfall traps travellers on a narrow pass", "A wyvern circles above an abandoned camp",
-          "Miners flee from a newly opened tunnel", "A hermit offers a dangerous shortcut",
-          "Competing climbers dispute ownership of supplies", "Distant horns echo from an unseen valley"}},
-        {{"A sandstorm uncovers a sealed doorway", "Thirsty mercenaries bargain for water",
-          "A caravan has vanished beyond the next dune", "Glass-like footprints lead across the sand",
-          "Nomad outriders warn of a forbidden route", "A mirage conceals a real oasis under threat"}},
-        {{"Hill giants argue over stolen livestock", "A beacon fire signals from an old watchtower",
-          "Shepherds report lights beneath a barrow", "A landslide has exposed giant bones",
-          "Two clans prepare to settle a border dispute", "Griffon riders search for a missing scout"}},
-        {{"A guarded wagon carries a secret prisoner", "Toll collectors display suspicious credentials",
-          "Refugees warn that the road ahead is blocked", "A travelling performer knows dangerous gossip",
-          "Saboteurs prepare to destroy a bridge", "An abandoned coach contains an unfinished message"}},
-    }};
-    static constexpr std::array<const char *, 6> complications{{
-        "A local authority arrives halfway through", "The apparent threat is protecting something",
-        "Severe weather begins without warning", "One participant recognises a party member",
-        "The encounter is bait for a second group", "Resolving it creates a debt or obligation",
-    }};
-    static constexpr std::array<const char *, 4> difficulties{{"LOW", "MODERATE", "HIGH", "SEVERE"}};
-
-    auto [col, row] = CursorTile();
-    int terrain = GetLayerValue(PaintMode::Terrain, TileKey(col, row));
-    terrain = std::clamp(terrain, 0, kTerrainCount - 1);
-    int encounterRoll = std::rand() % static_cast<int>(encounters[terrain].size());
-    int complicationRoll = std::rand() % static_cast<int>(complications.size());
-    int difficultyRoll = std::rand() % static_cast<int>(difficulties.size());
-    int d20 = 1 + std::rand() % 20;
-
-    gInfoTitle = "RANDOM ENCOUNTER";
-    gInfoLines = {
-        "TILE: " + std::to_string(col) + " " + std::to_string(row),
-        "TERRAIN: " + std::string(kTerrainNames[terrain]),
-        "D20: " + std::to_string(d20) + "   THREAT: " + difficulties[difficultyRoll],
-        std::string("SCENE: ") + encounters[terrain][encounterRoll],
-        std::string("TWIST: ") + complications[complicationRoll],
-    };
-    OpenModal(ModalType::Info, {});
-    LOG_INFO("Encounter at (%d, %d): %s; %s", col, row, encounters[terrain][encounterRoll],
-             complications[complicationRoll]);
+void ToggleEncounterPlacement() {
+    gPlacementMode = gPlacementMode == PlacementMode::Encounter ? PlacementMode::None
+                                                                 : PlacementMode::Encounter;
+    LOG_INFO("Encounter placement: %s",
+             gPlacementMode == PlacementMode::Encounter ? "click a map tile" : "cancelled");
 }
 
 // Dumps the map viewport (excluding the GUI sidebar) to a 24-bit BMP file.
@@ -2075,7 +2096,8 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
     AddUiButton(vertices, x0 + 166.0f, 468.0f, 78.0f, h, "DEL ROUTE", UiAction::DeleteRoute);
     AddUiButton(vertices, x0, 496.0f, 78.0f, h, "INFO", UiAction::WorldInfo);
     AddUiButton(vertices, x0 + 83.0f, 496.0f, 78.0f, h, "FIND", UiAction::Find);
-    AddUiButton(vertices, x0 + 166.0f, 496.0f, 78.0f, h, "ENCOUNTER", UiAction::RollEncounter);
+    AddUiButton(vertices, x0 + 166.0f, 496.0f, 78.0f, h, "ENCOUNTER", UiAction::NewEncounter,
+                0, gPlacementMode == PlacementMode::Encounter);
 
     headingText("PROJECT", 530.0f);
     std::string projectLabel = gProjectFile;
@@ -2150,7 +2172,8 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
     AppendUiText(vertices, "REGIONS " + std::to_string(gRegions.size()) + " CITIES " +
                                std::to_string(gCities.size()),
                  10.0f, 752.0f, 1.5f, {0.70f, 0.74f, 0.80f}, 35);
-    AppendUiText(vertices, "POIS " + std::to_string(gPois.size()) + " ROUTES " +
+    AppendUiText(vertices, "POI " + std::to_string(gPois.size()) + " ENC " +
+                               std::to_string(gEncounters.size()) + " ROUTES " +
                                std::to_string(gRoutes.size()),
                  10.0f, 768.0f, 1.5f, {0.70f, 0.74f, 0.80f}, 35);
     if (gActiveRegionId != 0 && gRegions.count(gActiveRegionId))
@@ -2166,8 +2189,10 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                  10.0f, 848.0f, 1.5f,
                  gProjectDirty ? Vec3{0.95f, 0.58f, 0.30f} : Vec3{0.45f, 0.78f, 0.52f}, 35);
     if (gPlacementMode != PlacementMode::None)
-        AppendUiText(vertices, gPlacementMode == PlacementMode::City ? "CLICK MAP FOR CITY"
-                                                                      : "CLICK MAP FOR POI",
+        AppendUiText(vertices, gPlacementMode == PlacementMode::City
+                                   ? "CLICK MAP FOR CITY"
+                                   : (gPlacementMode == PlacementMode::Poi ? "CLICK MAP FOR POI"
+                                                                           : "CLICK MAP FOR ENCOUNTER"),
                      10.0f, 864.0f, 1.5f, {0.95f, 0.65f, 0.30f}, 35);
 
     if (gSelectionActive) {
@@ -2204,12 +2229,15 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
         const char *title = gModalType == ModalType::Region ? "NEW REGION" :
                             gModalType == ModalType::City ? "NEW CITY" :
                             gModalType == ModalType::Poi ? "NEW POINT OF INTEREST" :
+                            gModalType == ModalType::Encounter
+                                ? (gEditingEncounterIndex >= 0 ? "EDIT ENCOUNTER" : "NEW ENCOUNTER") :
                             gModalType == ModalType::Info ? gInfoTitle.c_str() :
                             gModalType == ModalType::Confirm ? gInfoTitle.c_str() :
                             gModalType == ModalType::ProjectName ? "PROJECT FILE" :
                             gModalType == ModalType::Search ? "FIND ON MAP" : "NAME ROUTE";
         AppendUiText(vertices, title, mx + 24.0f, my + 24.0f, 2.5f, {0.95f, 0.82f, 0.42f});
-        if (gModalType == ModalType::City || gModalType == ModalType::Poi)
+        if (gModalType == ModalType::City || gModalType == ModalType::Poi ||
+            gModalType == ModalType::Encounter)
             AppendUiText(vertices, "TILE " + std::to_string(gModalCol) + " " + std::to_string(gModalRow),
                          mx + 350.0f, my + 29.0f, 1.5f, {0.72f, 0.77f, 0.84f}, 24);
         if (gModalType == ModalType::Info) {
@@ -2258,6 +2286,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                 AppendUiRect(vertices, mx + 24.0f, fy + 15.0f, mw - 48.0f, 32.0f, fieldColor);
                 std::string shown = gModalFields[i];
                 if (static_cast<int>(i) == gModalField) shown += "_";
+                if (shown.size() > 68) shown = "< " + shown.substr(shown.size() - 66);
                 AppendUiText(vertices, shown, mx + 32.0f, fy + 25.0f, 1.7f,
                              {0.95f, 0.95f, 0.96f}, 68);
                 gUiHits.push_back({mx + 24.0f, fy + 15.0f, mw - 48.0f, 32.0f,
@@ -2268,7 +2297,9 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
             AddUiButton(vertices, mx + mw - 210.0f, buttonY, 86.0f, 28.0f, "CANCEL", UiAction::ModalCancel);
             AddUiButton(vertices, mx + mw - 112.0f, buttonY, 88.0f, 28.0f,
                         gModalType == ModalType::ProjectName ? "APPLY" :
-                        gModalType == ModalType::Search ? "FIND" : "CREATE",
+                        gModalType == ModalType::Search ? "FIND" :
+                        (gModalType == ModalType::Encounter && gEditingEncounterIndex >= 0)
+                            ? "SAVE" : "CREATE",
                         UiAction::ModalAccept);
             AppendUiText(vertices, "ENTER NEXT   ESC CANCEL", mx + 24.0f, buttonY + 9.0f, 1.3f,
                          {0.60f, 0.64f, 0.70f});
@@ -2314,12 +2345,12 @@ void HandleUiAction(const UiHit &hit) {
             gPlacementMode = gPlacementMode == PlacementMode::Poi ? PlacementMode::None : PlacementMode::Poi;
             LOG_INFO("POI placement: %s", gPlacementMode == PlacementMode::Poi ? "click a map tile" : "cancelled");
             break;
+        case UiAction::NewEncounter: ToggleEncounterPlacement(); break;
         case UiAction::DeleteMarker: RemoveMarkerAtCursor(); break;
         case UiAction::DeleteRoute: RemoveRouteAtCursor(); break;
         case UiAction::WorldInfo: PrintWorldInfo(); break;
         case UiAction::Help: OpenKeybindHelp(); break;
         case UiAction::Find: OpenModal(ModalType::Search, {gLastSearchQuery}); break;
-        case UiAction::RollEncounter: RollEncounterAtCursor(); break;
         case UiAction::Undo: Undo(); break;
         case UiAction::Redo: Redo(); break;
         case UiAction::Save: RequestProjectSave(); break;
@@ -2404,7 +2435,8 @@ bool CursorOverGui() {
 
 void CharacterCallback(GLFWwindow * /*window*/, unsigned int codepoint) {
     if (gModalType == ModalType::None || gModalFields.empty()) return;
-    if (codepoint >= 32 && codepoint <= 126 && gModalFields[gModalField].size() < 80)
+    const size_t limit = gModalType == ModalType::Encounter && gModalField == 1 ? 240 : 80;
+    if (codepoint >= 32 && codepoint <= 126 && gModalFields[gModalField].size() < limit)
         gModalFields[gModalField].push_back(static_cast<char>(codepoint));
 }
 
@@ -2439,6 +2471,9 @@ void MouseButtonCallback(GLFWwindow * /*window*/, int button, int action, int mo
             } else if (gPlacementMode == PlacementMode::Poi) {
                 gPlacementMode = PlacementMode::None;
                 PlacePoiAtCursor();
+            } else if (gPlacementMode == PlacementMode::Encounter) {
+                gPlacementMode = PlacementMode::None;
+                PlaceEncounterAtCursor();
             } else if (gToolMode == ToolMode::Measure) {
                 auto [col, row] = CursorTile();
                 if (gMeasureStage == 1) {
@@ -2698,7 +2733,7 @@ void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int 
     } else if (key == GLFW_KEY_F && (mods & GLFW_MOD_CONTROL)) {
         OpenModal(ModalType::Search, {gLastSearchQuery});
     } else if (key == GLFW_KEY_E && (mods & GLFW_MOD_CONTROL)) {
-        RollEncounterAtCursor();
+        ToggleEncounterPlacement();
     } else if (key == GLFW_KEY_C && (mods & GLFW_MOD_CONTROL) && gSelectionActive) {
         CopySelection(false);
     } else if (key == GLFW_KEY_X && (mods & GLFW_MOD_CONTROL) && gSelectionActive) {
@@ -3126,7 +3161,7 @@ void AppendRegularPolygon(std::vector<float> &vertices, float cx, float cy, floa
     }
 }
 
-// Rebuilds point-of-interest markers (a bordered, kind-specific polygon) for POIs in view.
+// Rebuilds POI and DM-only encounter markers currently in view.
 void RebuildPoiMarkers(GLuint vbo, GLsizei &outVertexCount) {
     std::vector<float> vertices;
 
@@ -3145,6 +3180,24 @@ void RebuildPoiMarkers(GLuint vbo, GLsizei &outVertexCount) {
         AppendRegularPolygon(vertices, cx, cy, outer, visual.sides, visual.rotation, 0.05f, 0.05f, 0.05f);
         AppendRegularPolygon(vertices, cx, cy, inner, visual.sides, visual.rotation, visual.color.r,
                             visual.color.g, visual.color.b);
+    }
+
+    if (!gPlayerView) {
+        for (const auto &encounter : gEncounters) {
+            auto [worldCx, worldCy] = TileCenterWorld(encounter.col, encounter.row);
+            float cx = static_cast<float>((worldCx - gCameraX) * gZoom);
+            float cy = static_cast<float>((worldCy - gCameraY) * gZoom);
+            if (cx < -kTileSize || cy < -kTileSize || cx > gWindowWidth + kTileSize ||
+                cy > gWindowHeight + kTileSize)
+                continue;
+
+            float outer = static_cast<float>(kTileSize * gZoom * 0.42);
+            float inner = static_cast<float>(kTileSize * gZoom * 0.31);
+            float center = static_cast<float>(kTileSize * gZoom * 0.11);
+            AppendRegularPolygon(vertices, cx, cy, outer, 6, 0.0f, 0.05f, 0.05f, 0.05f);
+            AppendRegularPolygon(vertices, cx, cy, inner, 6, 0.0f, 0.95f, 0.32f, 0.12f);
+            AppendRegularPolygon(vertices, cx, cy, center, 6, 0.0f, 0.16f, 0.05f, 0.03f);
+        }
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -3317,6 +3370,21 @@ void RebuildLabelMesh(GLuint vbo, GLsizei &outVertexCount) {
             continue;
         double worldTopY = worldCenterY + (gHexGrid ? kHexRowHeight : kTileSize) * 0.5 + kLabelPixelSize;
         AppendLabelText(vertices, poi.name, worldCenterX, worldTopY, GetPoiVisual(poi.kind).color);
+    }
+
+    if (!gPlayerView) {
+        for (const auto &encounter : gEncounters) {
+            auto [worldCenterX, worldCenterY] = TileCenterWorld(encounter.col, encounter.row);
+            float cx = static_cast<float>((worldCenterX - gCameraX) * gZoom);
+            float cy = static_cast<float>((worldCenterY - gCameraY) * gZoom);
+            if (cx < -kTileSize || cy < -kTileSize || cx > gWindowWidth + kTileSize ||
+                cy > gWindowHeight + kTileSize)
+                continue;
+            double worldTopY =
+                worldCenterY + (gHexGrid ? kHexRowHeight : kTileSize) * 0.5 + kLabelPixelSize;
+            AppendLabelText(vertices, encounter.name, worldCenterX, worldTopY,
+                            {0.95f, 0.32f, 0.12f});
+        }
     }
 
     if (gShowRegions) {
@@ -3626,10 +3694,11 @@ int main() {
     LOG_INFO("  M                 : arm city placement, then click its tile and complete the form");
     LOG_INFO("  K                 : arm POI placement, then click its tile and complete the form");
     LOG_INFO("  Click city / POI  : open its information card");
-    LOG_INFO("  Ctrl+F / Find     : search and jump to cities, POIs, regions or routes");
+    LOG_INFO("  Click encounter   : edit its name and description");
+    LOG_INFO("  Ctrl+F / Find     : search and jump to cities, POIs, encounters, regions or routes");
     LOG_INFO("                      Repeat a search to cycle through matching results");
-    LOG_INFO("  Ctrl+E / Encounter: roll a terrain-aware encounter at the cursor tile");
-    LOG_INFO("  Delete            : otherwise remove the city or point of interest at the cursor");
+    LOG_INFO("  Ctrl+E / Encounter: arm encounter placement, then click its tile and complete the form");
+    LOG_INFO("  Delete            : otherwise remove the city, POI, or encounter at the cursor");
     LOG_INFO("  X                 : remove the river/trade route nearest the cursor");
     LOG_INFO("  I                 : print region/city/POI/route info to the console/log");
     LOG_INFO("  [ / ]             : shrink / grow brush size");

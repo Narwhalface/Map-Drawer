@@ -20,7 +20,7 @@ inline constexpr std::size_t kBulkReserveLimit = 2000000;
 inline constexpr double kAutosaveIntervalSeconds = 5.0 * 60.0;
 inline constexpr double kKilometresPerTile = 10.0;
 inline constexpr double kWalkingKilometresPerDay = 40.0;
-inline constexpr int kProjectVersion = 3;
+inline constexpr int kProjectVersion = 4;
 inline constexpr int kMinElevation = -4;
 inline constexpr int kMaxElevation = 8;
 inline constexpr int kDefaultMetresPerElevationLevel = 250;
@@ -41,4 +41,3 @@ inline constexpr const char *kDefaultProjectFile = "map_drawer_project.txt";
 inline constexpr const char *kAutosaveFile = "map_drawer_autosave.txt";
 inline constexpr const char *kConfigFile = "map_drawer.cfg";
 inline constexpr const char *kBackupDirectory = "backups";
-

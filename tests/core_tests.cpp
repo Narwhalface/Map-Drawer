@@ -57,6 +57,7 @@ void TestProjectRoundTrip() {
     source.regions[1] = {1, {0.2f, 0.4f, 0.6f}, "North Reach", "Ada"};
     source.cities.push_back({-2, 7, "Stonehome", "Ada"});
     source.pointsOfInterest.push_back({8, 9, PoiKind::Ruin, "Old Gate", "Collapsed arch"});
+    source.encounters.push_back({4, -3, "Goblin Ambush", "Six goblins attack from the ridge"});
     source.routes.push_back({RouteKind::River, "Bluewater", {{1.25, 2.5}, {3.75, 4.0}}});
 
     std::filesystem::path path = std::filesystem::temp_directory_path() / "map_drawer_round_trip.txt";
@@ -76,6 +77,10 @@ void TestProjectRoundTrip() {
     Check(loaded.pointsOfInterest.size() == 1 &&
               loaded.pointsOfInterest[0].kind == PoiKind::Ruin,
           "POI metadata round-trips");
+    Check(loaded.encounters.size() == 1 &&
+              loaded.encounters[0].name == "Goblin Ambush" &&
+              loaded.encounters[0].description == "Six goblins attack from the ridge",
+          "encounter metadata round-trips");
     Check(loaded.routes.size() == 1 && loaded.routes[0].points.size() == 2,
           "route geometry round-trips");
 
@@ -96,4 +101,3 @@ int main() {
     std::cout << "All core tests passed\n";
     return 0;
 }
-

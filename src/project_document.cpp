@@ -81,6 +81,12 @@ bool SaveProjectDocument(const std::string &path, const ProjectDocument &documen
                << std::quoted(poi.name) << ' ' << std::quoted(poi.description) << '\n';
     }
 
+    output << "ENCOUNTERS " << document.encounters.size() << '\n';
+    for (const Encounter &encounter : document.encounters) {
+        output << encounter.col << ' ' << encounter.row << ' ' << std::quoted(encounter.name) << ' '
+               << std::quoted(encounter.description) << '\n';
+    }
+
     output << "ROUTES " << document.routes.size() << '\n';
     for (const Route &route : document.routes) {
         output << static_cast<int>(route.kind) << ' ' << route.points.size() << ' '
@@ -223,6 +229,25 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
         loaded.pointsOfInterest.push_back(std::move(poi));
     }
 
+    if (loadedVersion >= 4) {
+        std::size_t encounterCount = 0;
+        if (!ReadSectionCount(input, "ENCOUNTERS", encounterCount)) {
+            errorMessage = "invalid ENCOUNTERS section";
+            return false;
+        }
+        loaded.encounters.reserve(encounterCount);
+        for (std::size_t index = 0; index < encounterCount; ++index) {
+            Encounter encounter;
+            input >> encounter.col >> encounter.row >> std::quoted(encounter.name)
+                  >> std::quoted(encounter.description);
+            if (!input) {
+                errorMessage = "invalid encounter data";
+                return false;
+            }
+            loaded.encounters.push_back(std::move(encounter));
+        }
+    }
+
     std::size_t routeCount = 0;
     if (!ReadSectionCount(input, "ROUTES", routeCount)) {
         errorMessage = "invalid ROUTES section";
@@ -262,4 +287,3 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
     document = std::move(loaded);
     return true;
 }
-
