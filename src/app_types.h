@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -17,6 +18,8 @@ struct TerrainDefinition {
     std::string name;
     Vec3 color{};
 };
+
+std::vector<TerrainDefinition> DefaultDungeonTerrainDefinitions();
 
 struct Region {
     int id = 0;
@@ -50,6 +53,26 @@ struct Encounter {
     std::string description;
 };
 
+enum class DungeonTileKind : uint8_t { Empty, Floor, Wall, Door, Water, Trap };
+inline constexpr int kDungeonTileKindCount = 6;
+
+struct Dungeon {
+    int32_t worldCol = 0;
+    int32_t worldRow = 0;
+    std::string name;
+    std::string description;
+    std::vector<TerrainDefinition> terrainDefinitions = DefaultDungeonTerrainDefinitions();
+    std::unordered_map<uint64_t, uint8_t> tiles;
+    std::unordered_map<uint64_t, int8_t> elevation;
+    std::unordered_map<uint64_t, uint8_t> fog;
+    bool hasEntrance = false;
+    int32_t entranceCol = 0;
+    int32_t entranceRow = 0;
+    bool hasExit = false;
+    int32_t exitCol = 0;
+    int32_t exitRow = 0;
+};
+
 struct PoiVisual {
     int sides = 4;
     float rotation = 0.0f;
@@ -68,23 +91,29 @@ enum class PaintMode { Terrain, Region, Elevation, Fog };
 enum class ElevationEditMode { Set, Raise, Lower, Flatten, Smooth };
 enum class ToolMode { Brush, FloodFill, Line, Curve, Polygon, Circle, Scatter, River, TradeRoute, Selection, Measure };
 enum class ModalType {
-    None, Region, City, Poi, Encounter, TerrainEditor, Route, Info, Confirm, ProjectName, Search
+    None, Region, City, Poi, Encounter, TerrainEditor, DungeonManager, DungeonDetails,
+    Route, Info, Confirm, ProjectName, Search
 };
 enum class PlacementMode { None, City, Poi, Encounter };
+enum class EditorTab { World, Dungeon };
+enum class DungeonPlacementMode { None, Entrance, Exit };
 enum class ConfirmAction { None, ClearLayer, LoadProject, OverwriteProject, RecoverAutosave, GenerateRelief };
 
 enum class UiAction {
     None, SetMode, SetTool, SetTerrain, EditTerrains, TerrainPagePrevious, TerrainPageNext,
     SetElevationValue, SetElevationTool,
     ElevationDown, ElevationUp, BrushDown, BrushUp, ToggleShape,
-    NewRegion, CycleRegion, NewCity, NewPoi, NewEncounter, DeleteMarker, DeleteRoute, WorldInfo, Help, Find,
+    NewRegion, CycleRegion, NewCity, NewPoi, NewEncounter, OpenDungeons, DeleteMarker, DeleteRoute,
+    WorldInfo, Help, Find,
     Undo, Redo, Save, Load, Clear, Export, ToggleGrid, ToggleGeometry, ToggleRegions,
     ToggleLabels, TogglePlayerView, ToggleElevationView, ToggleContours, ToggleHillshade, GenerateRelief,
     FogHideAll, FogRevealAll, ResetCamera, FitMap, ProjectName,
     SelectionCopy, SelectionCut, SelectionPaste, SelectionDelete,
     SelectionPaint, SelectionRegion, SelectionElevationDown, SelectionElevationUp, SelectionClear,
     ModalPrevious, ModalNext, ModalAccept, ModalCancel, ModalPoiKind,
-    ModalTerrainPrevious, ModalTerrainNext, ModalTerrainNew
+    ModalTerrainPrevious, ModalTerrainNext, ModalTerrainNew,
+    DungeonReturnWorld, DungeonSetTile, DungeonPlaceEntrance, DungeonPlaceExit,
+    DungeonFit, DungeonEditDetails, DungeonManagerOpen, DungeonManagerNew
 };
 
 struct TileChange {
@@ -127,6 +156,8 @@ extern const char *const kTerrainNames[kTerrainCount];
 std::vector<TerrainDefinition> DefaultTerrainDefinitions();
 
 const char *PoiKindName(PoiKind kind);
+const char *DungeonTileKindName(DungeonTileKind kind);
+Vec3 DungeonTileKindColor(DungeonTileKind kind);
 PoiVisual GetPoiVisual(PoiKind kind);
 Vec3 RouteColor(RouteKind kind);
 float RouteThickness(RouteKind kind);

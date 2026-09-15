@@ -27,6 +27,41 @@ std::vector<TerrainDefinition> DefaultTerrainDefinitions() {
     return definitions;
 }
 
+std::vector<TerrainDefinition> DefaultDungeonTerrainDefinitions() {
+    return {
+        {"Erase", {0.08f, 0.09f, 0.11f}},
+        {"Floor", {0.48f, 0.45f, 0.40f}},
+        {"Wall", {0.20f, 0.22f, 0.26f}},
+        {"Door", {0.58f, 0.32f, 0.12f}},
+        {"Water", {0.12f, 0.38f, 0.68f}},
+        {"Trap", {0.72f, 0.18f, 0.16f}},
+    };
+}
+
+const char *DungeonTileKindName(DungeonTileKind kind) {
+    switch (kind) {
+        case DungeonTileKind::Empty: return "Erase";
+        case DungeonTileKind::Floor: return "Floor";
+        case DungeonTileKind::Wall: return "Wall";
+        case DungeonTileKind::Door: return "Door";
+        case DungeonTileKind::Water: return "Water";
+        case DungeonTileKind::Trap: return "Trap";
+    }
+    return "?";
+}
+
+Vec3 DungeonTileKindColor(DungeonTileKind kind) {
+    switch (kind) {
+        case DungeonTileKind::Empty: return {0.08f, 0.09f, 0.11f};
+        case DungeonTileKind::Floor: return {0.48f, 0.45f, 0.40f};
+        case DungeonTileKind::Wall: return {0.20f, 0.22f, 0.26f};
+        case DungeonTileKind::Door: return {0.58f, 0.32f, 0.12f};
+        case DungeonTileKind::Water: return {0.12f, 0.38f, 0.68f};
+        case DungeonTileKind::Trap: return {0.72f, 0.18f, 0.16f};
+    }
+    return {1.0f, 0.0f, 1.0f};
+}
+
 const char *PoiKindName(PoiKind kind) {
     switch (kind) {
         case PoiKind::Dungeon: return "Dungeon";

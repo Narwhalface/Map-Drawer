@@ -25,6 +25,13 @@ bool ReadSectionCount(std::istream &input, const char *expectedName, std::size_t
     return static_cast<bool>(input) && actualName == expectedName;
 }
 
+bool IsUnitColor(const Vec3 &color) {
+    const auto valid = [](float value) {
+        return std::isfinite(value) && value >= 0.0f && value <= 1.0f;
+    };
+    return valid(color.r) && valid(color.g) && valid(color.b);
+}
+
 template <typename Layer>
 bool ReadUnsignedTileLayer(std::istream &input, const char *name, Layer &layer, int maximumValue) {
     std::size_t count = 0;
@@ -37,6 +44,23 @@ bool ReadUnsignedTileLayer(std::istream &input, const char *name, Layer &layer, 
         input >> column >> row >> value;
         if (!input || value <= 0 || value > maximumValue) return false;
         layer[grid_geometry::Pack(column, row)] = static_cast<uint8_t>(value);
+    }
+    return true;
+}
+
+template <typename Layer>
+bool ReadSignedTileLayer(std::istream &input, const char *name, Layer &layer,
+                         int minimumValue, int maximumValue) {
+    std::size_t count = 0;
+    if (!ReadSectionCount(input, name, count)) return false;
+    layer.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        int32_t column = 0;
+        int32_t row = 0;
+        int value = 0;
+        input >> column >> row >> value;
+        if (!input || value == 0 || value < minimumValue || value > maximumValue) return false;
+        layer[grid_geometry::Pack(column, row)] = static_cast<int8_t>(value);
     }
     return true;
 }
@@ -91,6 +115,26 @@ bool SaveProjectDocument(const std::string &path, const ProjectDocument &documen
     for (const Encounter &encounter : document.encounters) {
         output << encounter.col << ' ' << encounter.row << ' ' << std::quoted(encounter.name) << ' '
                << std::quoted(encounter.description) << '\n';
+    }
+
+    output << "DUNGEONS " << document.dungeons.size() << '\n';
+    for (const Dungeon &dungeon : document.dungeons) {
+        output << dungeon.worldCol << ' ' << dungeon.worldRow << ' '
+               << (dungeon.hasEntrance ? 1 : 0) << ' ' << dungeon.entranceCol << ' '
+               << dungeon.entranceRow << ' ' << (dungeon.hasExit ? 1 : 0) << ' '
+               << dungeon.exitCol << ' ' << dungeon.exitRow << ' ' << dungeon.tiles.size() << ' '
+               << std::quoted(dungeon.name) << ' ' << std::quoted(dungeon.description) << '\n';
+        for (const auto &[key, value] : dungeon.tiles) {
+            auto [column, row] = grid_geometry::Unpack(key);
+            output << column << ' ' << row << ' ' << static_cast<int>(value) << '\n';
+        }
+        output << "DUNGEON_TERRAINS " << dungeon.terrainDefinitions.size() << '\n';
+        for (const TerrainDefinition &terrain : dungeon.terrainDefinitions) {
+            output << terrain.color.r << ' ' << terrain.color.g << ' ' << terrain.color.b << ' '
+                   << std::quoted(terrain.name) << '\n';
+        }
+        WriteTileLayer(output, "DUNGEON_ELEVATION", dungeon.elevation);
+        WriteTileLayer(output, "DUNGEON_FOG", dungeon.fog);
     }
 
     output << "ROUTES " << document.routes.size() << '\n';
@@ -279,6 +323,79 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
         }
     }
 
+    if (loadedVersion >= 6) {
+        std::size_t dungeonCount = 0;
+        if (!ReadSectionCount(input, "DUNGEONS", dungeonCount)) {
+            errorMessage = "invalid DUNGEONS section";
+            return false;
+        }
+        loaded.dungeons.reserve(dungeonCount);
+        for (std::size_t index = 0; index < dungeonCount; ++index) {
+            Dungeon dungeon;
+            int hasEntrance = 0;
+            int hasExit = 0;
+            std::size_t tileCount = 0;
+            input >> dungeon.worldCol >> dungeon.worldRow >> hasEntrance >> dungeon.entranceCol
+                  >> dungeon.entranceRow >> hasExit >> dungeon.exitCol >> dungeon.exitRow
+                  >> tileCount >> std::quoted(dungeon.name) >> std::quoted(dungeon.description);
+            if (!input || dungeon.name.empty() || (hasEntrance != 0 && hasEntrance != 1) ||
+                (hasExit != 0 && hasExit != 1)) {
+                errorMessage = "invalid dungeon metadata";
+                return false;
+            }
+            dungeon.hasEntrance = hasEntrance != 0;
+            dungeon.hasExit = hasExit != 0;
+            dungeon.tiles.reserve(tileCount);
+            for (std::size_t tileIndex = 0; tileIndex < tileCount; ++tileIndex) {
+                int32_t column = 0;
+                int32_t row = 0;
+                int value = 0;
+                input >> column >> row >> value;
+                if (!input || value <= 0 || value >= kMaxTerrainTypes) {
+                    errorMessage = "invalid dungeon tile";
+                    return false;
+                }
+                dungeon.tiles[grid_geometry::Pack(column, row)] = static_cast<uint8_t>(value);
+            }
+            if (loadedVersion >= 8) {
+                std::size_t terrainCount = 0;
+                if (!ReadSectionCount(input, "DUNGEON_TERRAINS", terrainCount) ||
+                    terrainCount < 2 || terrainCount > static_cast<std::size_t>(kMaxTerrainTypes)) {
+                    errorMessage = "invalid dungeon terrain definitions";
+                    return false;
+                }
+                dungeon.terrainDefinitions.clear();
+                dungeon.terrainDefinitions.reserve(terrainCount);
+                for (std::size_t terrainIndex = 0; terrainIndex < terrainCount; ++terrainIndex) {
+                    TerrainDefinition terrain;
+                    input >> terrain.color.r >> terrain.color.g >> terrain.color.b >> std::quoted(terrain.name);
+                    if (!input || terrain.name.empty() || !IsUnitColor(terrain.color)) {
+                        errorMessage = "invalid dungeon terrain definition";
+                        return false;
+                    }
+                    dungeon.terrainDefinitions.push_back(std::move(terrain));
+                }
+                if (!ReadSignedTileLayer(input, "DUNGEON_ELEVATION", dungeon.elevation,
+                                         kMinElevation, kMaxElevation)) {
+                    errorMessage = "invalid dungeon elevation layer";
+                    return false;
+                }
+                if (!ReadUnsignedTileLayer(input, "DUNGEON_FOG", dungeon.fog, 1)) {
+                    errorMessage = "invalid dungeon fog layer";
+                    return false;
+                }
+                for (const auto &[key, terrain] : dungeon.tiles) {
+                    (void)key;
+                    if (terrain >= dungeon.terrainDefinitions.size()) {
+                        errorMessage = "dungeon tile references an unknown terrain";
+                        return false;
+                    }
+                }
+            }
+            loaded.dungeons.push_back(std::move(dungeon));
+        }
+    }
+
     std::size_t routeCount = 0;
     if (!ReadSectionCount(input, "ROUTES", routeCount)) {
         errorMessage = "invalid ROUTES section";
@@ -313,6 +430,23 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
     if (!input || tag != "END") {
         errorMessage = "missing END marker";
         return false;
+    }
+
+    // Dungeon POIs are the overworld identity and access point for dungeon maps. Projects
+    // created before this relationship was enforced may only contain the dungeon record, so
+    // synthesize the matching marker during load rather than leaving that map unreachable.
+    for (const Dungeon &dungeon : loaded.dungeons) {
+        const auto poi = std::find_if(
+            loaded.pointsOfInterest.begin(), loaded.pointsOfInterest.end(),
+            [&](const PointOfInterest &candidate) {
+                return candidate.kind == PoiKind::Dungeon &&
+                       candidate.col == dungeon.worldCol && candidate.row == dungeon.worldRow;
+            });
+        if (poi == loaded.pointsOfInterest.end()) {
+            loaded.pointsOfInterest.push_back(
+                {dungeon.worldCol, dungeon.worldRow, PoiKind::Dungeon,
+                 dungeon.name, dungeon.description});
+        }
     }
 
     document = std::move(loaded);

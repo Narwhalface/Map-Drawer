@@ -17,6 +17,7 @@ struct ProjectDocument {
     std::vector<City> cities;
     std::vector<PointOfInterest> pointsOfInterest;
     std::vector<Encounter> encounters;
+    std::vector<Dungeon> dungeons;
     std::vector<Route> routes;
 
     bool hexGrid = true;

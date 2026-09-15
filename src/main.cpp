@@ -97,6 +97,7 @@ auto &gRegions = gProjectDocument.regions;
 auto &gCities = gProjectDocument.cities;
 auto &gPois = gProjectDocument.pointsOfInterest;
 auto &gEncounters = gProjectDocument.encounters;
+auto &gDungeons = gProjectDocument.dungeons;
 auto &gRoutes = gProjectDocument.routes;
 bool &gHexGrid = gProjectDocument.hexGrid;
 int &gMetresPerElevationLevel = gProjectDocument.metresPerElevationLevel;
@@ -125,6 +126,17 @@ int gBrushRadius = 0; // 0 = single tile, N = (2N+1)x(2N+1) square
 bool gRoundBrush = false; // false = square stamp, true = circular stamp (more organic edges)
 bool gShowGrid = true;
 bool gPlayerView = false;
+EditorTab gEditorTab = EditorTab::World;
+int gActiveDungeonIndex = -1;
+int gDungeonManagerIndex = -1;
+int gSelectedDungeonPoiIndex = -1;
+int gEditingDungeonIndex = -1;
+int gDungeonBrush = static_cast<int>(DungeonTileKind::Floor);
+DungeonPlacementMode gDungeonPlacementMode = DungeonPlacementMode::None;
+bool gEditingDungeonTerrain = false;
+double gWorldCameraX = -kUiWidth;
+double gWorldCameraY = 0.0;
+double gWorldZoom = 1.0;
 ToolMode gToolMode = ToolMode::Brush;
 bool gPaintingLeft = false;
 bool gPaintingRight = false;
@@ -219,7 +231,7 @@ uint64_t TileKey(int32_t col, int32_t row) {
 }
 
 std::pair<double, double> TileCenterWorld(int32_t col, int32_t row) {
-    return grid_geometry::TileCenter(col, row, gHexGrid);
+    return grid_geometry::TileCenter(col, row, gEditorTab == EditorTab::Dungeon ? false : gHexGrid);
 }
 
 std::pair<int32_t, int32_t> TileCoords(uint64_t key) {
@@ -227,7 +239,8 @@ std::pair<int32_t, int32_t> TileCoords(uint64_t key) {
 }
 
 std::pair<int32_t, int32_t> WorldToTile(double worldX, double worldY) {
-    return grid_geometry::WorldToTile(worldX, worldY, gHexGrid);
+    return grid_geometry::WorldToTile(worldX, worldY,
+                                      gEditorTab == EditorTab::Dungeon ? false : gHexGrid);
 }
 
 double MeasuredTileDistance() {
@@ -237,7 +250,8 @@ double MeasuredTileDistance() {
 
 void TileBoundsForWorldRect(double minX, double minY, double maxX, double maxY,
                             int32_t &minCol, int32_t &minRow, int32_t &maxCol, int32_t &maxRow) {
-    grid_geometry::BoundsForWorldRect(minX, minY, maxX, maxY, gHexGrid,
+    grid_geometry::BoundsForWorldRect(minX, minY, maxX, maxY,
+                                      gEditorTab == EditorTab::Dungeon ? false : gHexGrid,
                                       minCol, minRow, maxCol, maxRow);
 }
 
@@ -260,6 +274,21 @@ std::pair<double, double> CursorWorld() {
     double mouseX = 0.0, mouseY = 0.0;
     glfwGetCursorPos(gWindow, &mouseX, &mouseY);
     return {gCameraX + mouseX / gZoom, gCameraY + mouseY / gZoom};
+}
+
+Dungeon *ActiveDungeon() {
+    if (gActiveDungeonIndex < 0 || gActiveDungeonIndex >= static_cast<int>(gDungeons.size()))
+        return nullptr;
+    return &gDungeons[static_cast<size_t>(gActiveDungeonIndex)];
+}
+
+std::pair<int32_t, int32_t> DungeonWorldToTile(double worldX, double worldY) {
+    return grid_geometry::WorldToTile(worldX, worldY, false);
+}
+
+std::pair<int32_t, int32_t> DungeonCursorTile() {
+    auto [worldX, worldY] = CursorWorld();
+    return DungeonWorldToTile(worldX, worldY);
 }
 
 void FitMapToWindow() {
@@ -323,10 +352,118 @@ void FitMapToWindow() {
 }
 
 std::array<std::pair<int32_t, int32_t>, 8> NeighborTiles(int32_t col, int32_t row, int &count) {
-    return grid_geometry::Neighbors(col, row, gHexGrid, count);
+    return grid_geometry::Neighbors(col, row,
+                                    gEditorTab == EditorTab::Dungeon ? false : gHexGrid, count);
+}
+
+void FitDungeonToWindow() {
+    Dungeon *dungeon = ActiveDungeon();
+    if (!dungeon) return;
+    bool haveBounds = false;
+    int32_t minCol = 0, minRow = 0, maxCol = 0, maxRow = 0;
+    auto includeTile = [&](int32_t col, int32_t row) {
+        if (!haveBounds) {
+            minCol = maxCol = col;
+            minRow = maxRow = row;
+            haveBounds = true;
+        } else {
+            minCol = std::min(minCol, col);
+            minRow = std::min(minRow, row);
+            maxCol = std::max(maxCol, col);
+            maxRow = std::max(maxRow, row);
+        }
+    };
+    for (const auto &[key, value] : dungeon->tiles) {
+        (void)value;
+        auto [col, row] = TileCoords(key);
+        includeTile(col, row);
+    }
+    for (const auto &[key, value] : dungeon->elevation) {
+        (void)value;
+        auto [col, row] = TileCoords(key);
+        includeTile(col, row);
+    }
+    for (const auto &[key, value] : dungeon->fog) {
+        (void)value;
+        auto [col, row] = TileCoords(key);
+        includeTile(col, row);
+    }
+    if (dungeon->hasEntrance) includeTile(dungeon->entranceCol, dungeon->entranceRow);
+    if (dungeon->hasExit) includeTile(dungeon->exitCol, dungeon->exitRow);
+    if (!haveBounds) {
+        includeTile(0, 0);
+        includeTile(12, 8);
+    }
+    double worldWidth = std::max(static_cast<double>(kTileSize),
+                                 static_cast<double>(maxCol - minCol + 1) * kTileSize);
+    double worldHeight = std::max(static_cast<double>(kTileSize),
+                                  static_cast<double>(maxRow - minRow + 1) * kTileSize);
+    double canvasWidth = std::max(100.0, static_cast<double>(gWindowWidth) - kUiWidth - 60.0);
+    double canvasHeight = std::max(100.0, static_cast<double>(gWindowHeight) - 60.0);
+    gZoom = std::clamp(std::min(canvasWidth / worldWidth, canvasHeight / worldHeight),
+                       kMinZoom, kMaxZoom);
+    double centerX = (static_cast<double>(minCol + maxCol + 1) * kTileSize) * 0.5;
+    double centerY = (static_cast<double>(minRow + maxRow + 1) * kTileSize) * 0.5;
+    double screenCenterX = kUiWidth + (gWindowWidth - kUiWidth) * 0.5;
+    gCameraX = centerX - screenCenterX / gZoom;
+    gCameraY = centerY - (gWindowHeight * 0.5) / gZoom;
+}
+
+void OpenDungeonTab(int index) {
+    if (index < 0 || index >= static_cast<int>(gDungeons.size())) return;
+    if (gEditorTab == EditorTab::World) {
+        gWorldCameraX = gCameraX;
+        gWorldCameraY = gCameraY;
+        gWorldZoom = gZoom;
+    }
+    gEditorTab = EditorTab::Dungeon;
+    gActiveDungeonIndex = index;
+    gDungeonPlacementMode = DungeonPlacementMode::None;
+    gPaintMode = PaintMode::Terrain;
+    gToolMode = ToolMode::Brush;
+    gDungeonBrush = std::clamp(gDungeonBrush, 1,
+                               static_cast<int>(gDungeons[static_cast<size_t>(index)]
+                                                    .terrainDefinitions.size()) - 1);
+    gTerrainPage = gDungeonBrush / kTerrainPageSize;
+    gPaintingLeft = false;
+    gPaintingRight = false;
+    gMeasureStage = 0;
+    gLastFoundLabel.clear();
+    gUndoStack.clear();
+    gRedoStack.clear();
+    FitDungeonToWindow();
+    ++gSceneRevision;
+    UpdateWindowTitle();
+}
+
+void ReturnToWorldTab() {
+    if (gEditorTab == EditorTab::World) return;
+    gEditorTab = EditorTab::World;
+    gDungeonPlacementMode = DungeonPlacementMode::None;
+    gUndoStack.clear();
+    gRedoStack.clear();
+    gCameraX = gWorldCameraX;
+    gCameraY = gWorldCameraY;
+    gZoom = gWorldZoom;
+    ++gSceneRevision;
+    UpdateWindowTitle();
 }
 
 int GetLayerValue(PaintMode layer, uint64_t key) {
+    if (gEditorTab == EditorTab::Dungeon) {
+        Dungeon *dungeon = ActiveDungeon();
+        if (!dungeon || layer == PaintMode::Region) return 0;
+        if (layer == PaintMode::Terrain) {
+            auto it = dungeon->tiles.find(key);
+            return it == dungeon->tiles.end() ? 0 : it->second;
+        }
+        if (layer == PaintMode::Elevation) {
+            auto it = dungeon->elevation.find(key);
+            return it == dungeon->elevation.end() ? 0 : it->second;
+        }
+        auto it = dungeon->fog.find(key);
+        return it == dungeon->fog.end() ? 0 : it->second;
+    }
     if (layer == PaintMode::Terrain) {
         auto it = gMapData.find(key);
         return it == gMapData.end() ? 0 : it->second;
@@ -370,7 +507,44 @@ void MarkProjectDirty() {
     gLastFoundLabel.clear();
 }
 
+void PlaceDungeonSpecialAtCursor() {
+    Dungeon *dungeon = ActiveDungeon();
+    if (!dungeon || gDungeonPlacementMode == DungeonPlacementMode::None) return;
+    auto [col, row] = DungeonCursorTile();
+    if (dungeon->tiles.count(TileKey(col, row)) == 0)
+        dungeon->tiles[TileKey(col, row)] = static_cast<uint8_t>(std::max(1, gDungeonBrush));
+    if (gDungeonPlacementMode == DungeonPlacementMode::Entrance) {
+        dungeon->hasEntrance = true;
+        dungeon->entranceCol = col;
+        dungeon->entranceRow = row;
+        LOG_INFO("Dungeon entrance placed at (%d, %d)", col, row);
+    } else {
+        dungeon->hasExit = true;
+        dungeon->exitCol = col;
+        dungeon->exitRow = row;
+        LOG_INFO("Dungeon exit placed at (%d, %d)", col, row);
+    }
+    gDungeonPlacementMode = DungeonPlacementMode::None;
+    ++gSceneRevision;
+    MarkProjectDirty();
+}
+
 void SetLayerValue(PaintMode layer, uint64_t key, int value) {
+    if (gEditorTab == EditorTab::Dungeon) {
+        Dungeon *dungeon = ActiveDungeon();
+        if (!dungeon || layer == PaintMode::Region) return;
+        if (layer == PaintMode::Terrain) {
+            if (value == 0) dungeon->tiles.erase(key);
+            else dungeon->tiles[key] = static_cast<uint8_t>(value);
+        } else if (layer == PaintMode::Elevation) {
+            if (value == 0) dungeon->elevation.erase(key);
+            else dungeon->elevation[key] = static_cast<int8_t>(value);
+        } else {
+            if (value == 0) dungeon->fog.erase(key);
+            else dungeon->fog[key] = static_cast<uint8_t>(value);
+        }
+        return;
+    }
     if (layer == PaintMode::Terrain) {
         if (value == 0) gMapData.erase(key);
         else gMapData[key] = static_cast<uint8_t>(value);
@@ -389,10 +563,12 @@ void SetLayerValue(PaintMode layer, uint64_t key, int value) {
 // Returns the value the active tool should paint with, or -1 if painting isn't possible
 // right now (e.g. region mode with no active region selected).
 int ActivePaintValue() {
-    if (gPaintMode == PaintMode::Terrain) return gBrush;
+    if (gPaintMode == PaintMode::Terrain)
+        return gEditorTab == EditorTab::Dungeon ? gDungeonBrush : gBrush;
     if (gPaintMode == PaintMode::Elevation)
         return gElevationEditMode == ElevationEditMode::Set ? gElevationBrush : 1;
     if (gPaintMode == PaintMode::Fog) return 1;
+    if (gEditorTab == EditorTab::Dungeon) return kNoPaintValue;
     if (gActiveRegionId == 0) {
         LOG_WARN("No active region - press N to found one first");
         return kNoPaintValue;
@@ -419,7 +595,15 @@ void BeginStroke(size_t expectedTiles = 0, int paintValue = kNoPaintValue) {
     if (expectedTiles > 0) {
         gStrokeOriginal.reserve(expectedTiles);
         if (paintValue != 0) {
-            if (gStrokeLayer == PaintMode::Terrain) gMapData.reserve(gMapData.size() + expectedTiles);
+            Dungeon *dungeon = ActiveDungeon();
+            if (gEditorTab == EditorTab::Dungeon && dungeon) {
+                if (gStrokeLayer == PaintMode::Terrain)
+                    dungeon->tiles.reserve(dungeon->tiles.size() + expectedTiles);
+                else if (gStrokeLayer == PaintMode::Elevation)
+                    dungeon->elevation.reserve(dungeon->elevation.size() + expectedTiles);
+                else if (gStrokeLayer == PaintMode::Fog)
+                    dungeon->fog.reserve(dungeon->fog.size() + expectedTiles);
+            } else if (gStrokeLayer == PaintMode::Terrain) gMapData.reserve(gMapData.size() + expectedTiles);
             else if (gStrokeLayer == PaintMode::Region) gRegionData.reserve(gRegionData.size() + expectedTiles);
             else if (gStrokeLayer == PaintMode::Elevation) gElevationData.reserve(gElevationData.size() + expectedTiles);
             else gFogData.reserve(gFogData.size() + expectedTiles);
@@ -471,10 +655,19 @@ void SetTileRecorded(int32_t col, int32_t row, int value) {
         }
         return true;
     };
-    bool changed = layer == PaintMode::Terrain ? update(gMapData)
-                   : layer == PaintMode::Region ? update(gRegionData)
-                   : layer == PaintMode::Elevation ? update(gElevationData)
-                                                   : update(gFogData);
+    bool changed = false;
+    Dungeon *dungeon = ActiveDungeon();
+    if (gEditorTab == EditorTab::Dungeon && dungeon) {
+        changed = layer == PaintMode::Terrain ? update(dungeon->tiles)
+                  : layer == PaintMode::Elevation ? update(dungeon->elevation)
+                  : layer == PaintMode::Fog ? update(dungeon->fog)
+                                            : false;
+    } else {
+        changed = layer == PaintMode::Terrain ? update(gMapData)
+                  : layer == PaintMode::Region ? update(gRegionData)
+                  : layer == PaintMode::Elevation ? update(gElevationData)
+                                                  : update(gFogData);
+    }
     if (changed) {
         MarkProjectDirty();
         if (gStrokeActive) gStrokeChanged = true;
@@ -556,10 +749,11 @@ void FloodFill(int32_t col, int32_t row, int value) {
         constexpr int hexDc[6] = {0, 0, 1, 1, -1, -1};
         constexpr int evenHexDr[6] = {-1, 1, -1, 0, -1, 0};
         constexpr int oddHexDr[6] = {-1, 1, 0, 1, 0, 1};
-        int neighborCount = gHexGrid ? 6 : 4;
+        bool hexGrid = gEditorTab == EditorTab::World && gHexGrid;
+        int neighborCount = hexGrid ? 6 : 4;
         for (int i = 0; i < neighborCount; ++i) {
-            int32_t nc = c + (gHexGrid ? hexDc[i] : squareDc[i]);
-            int32_t nr = r + (gHexGrid ? ((c % 2 != 0) ? oddHexDr[i] : evenHexDr[i]) : squareDr[i]);
+            int32_t nc = c + (hexGrid ? hexDc[i] : squareDc[i]);
+            int32_t nr = r + (hexGrid ? ((c % 2 != 0) ? oddHexDr[i] : evenHexDr[i]) : squareDr[i]);
             uint64_t key = TileKey(nc, nr);
             if (visited.count(key)) continue;
             if (GetCurrentLayerValue(nc, nr) == target) {
@@ -600,7 +794,7 @@ void CommitRectFill() {
 // Whether tile offset (dc, dr) from the brush center is covered by the current brush shape.
 bool BrushCovers(int32_t centerCol, int32_t dc, int32_t dr) {
     if (!gRoundBrush || gBrushRadius == 0) return true;
-    if (gHexGrid) {
+    if (gEditorTab == EditorTab::World && gHexGrid) {
         auto cubeZ = [](int32_t col, int32_t row) {
             int32_t parity = (col % 2 != 0) ? 1 : 0;
             return row - (col - parity) / 2;
@@ -708,7 +902,8 @@ void FillPolygon(const std::vector<std::pair<double, double>> &points, int value
     BeginStroke(EstimatedTileCount(minCol, minRow, maxCol, maxRow), value);
     size_t changed = 0;
     for (int32_t row = minRow; row <= maxRow; ++row) {
-        int parityPasses = gHexGrid ? 2 : 1;
+        bool hexGrid = gEditorTab == EditorTab::World && gHexGrid;
+        int parityPasses = hexGrid ? 2 : 1;
         for (int parity = 0; parity < parityPasses; ++parity) {
             int32_t sampleCol = parity;
             double testY = TileCenterWorld(sampleCol, row).second;
@@ -725,7 +920,7 @@ void FillPolygon(const std::vector<std::pair<double, double>> &points, int value
             std::sort(intersections.begin(), intersections.end());
             size_t intersectionIndex = 0;
             for (int32_t col = minCol; col <= maxCol; ++col) {
-                if (gHexGrid && ((col % 2 != 0) ? 1 : 0) != parity) continue;
+                if (hexGrid && ((col % 2 != 0) ? 1 : 0) != parity) continue;
                 double testX = TileCenterWorld(col, row).first;
                 while (intersectionIndex < intersections.size() &&
                        intersections[intersectionIndex] <= testX)
@@ -762,15 +957,95 @@ void OpenModal(ModalType type, std::vector<std::string> fields) {
     gModalError.clear();
 }
 
+int FindDungeonAtWorldTile(int32_t col, int32_t row) {
+    auto it = std::find_if(gDungeons.begin(), gDungeons.end(), [&](const Dungeon &dungeon) {
+        return dungeon.worldCol == col && dungeon.worldRow == row;
+    });
+    return it == gDungeons.end() ? -1 : static_cast<int>(it - gDungeons.begin());
+}
+
+int FindDungeonPoiAtWorldTile(int32_t col, int32_t row) {
+    auto it = std::find_if(gPois.begin(), gPois.end(), [&](const PointOfInterest &poi) {
+        return poi.kind == PoiKind::Dungeon && poi.col == col && poi.row == row;
+    });
+    return it == gPois.end() ? -1 : static_cast<int>(it - gPois.begin());
+}
+
+void OpenDungeonManagerForPoi(int poiIndex) {
+    if (poiIndex < 0 || poiIndex >= static_cast<int>(gPois.size()) ||
+        gPois[static_cast<size_t>(poiIndex)].kind != PoiKind::Dungeon)
+        return;
+    const PointOfInterest &poi = gPois[static_cast<size_t>(poiIndex)];
+    gSelectedDungeonPoiIndex = poiIndex;
+    gModalCol = poi.col;
+    gModalRow = poi.row;
+    gDungeonManagerIndex = FindDungeonAtWorldTile(poi.col, poi.row);
+    OpenModal(ModalType::DungeonManager, {});
+}
+
+void OpenDungeonManager() {
+    if (gEditorTab != EditorTab::World || gSelectedDungeonPoiIndex < 0 ||
+        gSelectedDungeonPoiIndex >= static_cast<int>(gPois.size()) ||
+        gPois[static_cast<size_t>(gSelectedDungeonPoiIndex)].kind != PoiKind::Dungeon) {
+        gInfoTitle = "SELECT A DUNGEON";
+        gInfoLines = {"CLICK A DUNGEON POI ON THE OVERWORLD FIRST",
+                      "DUNGEON MAPS CAN ONLY BE OPENED THROUGH THEIR POI MARKER"};
+        OpenModal(ModalType::Info, {});
+        return;
+    }
+    OpenDungeonManagerForPoi(gSelectedDungeonPoiIndex);
+}
+
+void OpenNewDungeonForm() {
+    if (gSelectedDungeonPoiIndex < 0 ||
+        gSelectedDungeonPoiIndex >= static_cast<int>(gPois.size()))
+        return;
+    const PointOfInterest &poi = gPois[static_cast<size_t>(gSelectedDungeonPoiIndex)];
+    gModalCol = poi.col;
+    gModalRow = poi.row;
+    gEditingDungeonIndex = -1;
+    OpenModal(ModalType::DungeonDetails, {poi.name, poi.description});
+}
+
+void OpenDungeonDetailsForm() {
+    Dungeon *dungeon = ActiveDungeon();
+    if (!dungeon) return;
+    gModalCol = dungeon->worldCol;
+    gModalRow = dungeon->worldRow;
+    gSelectedDungeonPoiIndex =
+        FindDungeonPoiAtWorldTile(dungeon->worldCol, dungeon->worldRow);
+    gEditingDungeonIndex = gActiveDungeonIndex;
+    OpenModal(ModalType::DungeonDetails, {dungeon->name, dungeon->description});
+}
+
 int TerrainColorByte(float value) {
     return static_cast<int>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
 }
 
+std::vector<TerrainDefinition> &ActiveTerrainDefinitions() {
+    Dungeon *dungeon = ActiveDungeon();
+    if (gEditorTab == EditorTab::Dungeon && dungeon) return dungeon->terrainDefinitions;
+    return gTerrainDefinitions;
+}
+
+std::vector<TerrainDefinition> &EditedTerrainDefinitions() {
+    if (gEditingDungeonTerrain) {
+        Dungeon *dungeon = ActiveDungeon();
+        if (dungeon) return dungeon->terrainDefinitions;
+    }
+    return gTerrainDefinitions;
+}
+
 void LoadTerrainEditorFields(int terrainIndex) {
-    if (gTerrainDefinitions.empty()) gTerrainDefinitions = DefaultTerrainDefinitions();
+    std::vector<TerrainDefinition> &definitions = EditedTerrainDefinitions();
+    if (definitions.empty())
+        definitions = gEditingDungeonTerrain ? DefaultDungeonTerrainDefinitions()
+                                             : DefaultTerrainDefinitions();
+    int minimumIndex = gEditingDungeonTerrain ? 1 : 0;
     gEditingTerrainIndex = std::clamp(terrainIndex, 0,
-                                     static_cast<int>(gTerrainDefinitions.size()) - 1);
-    const TerrainDefinition &terrain = gTerrainDefinitions[static_cast<size_t>(gEditingTerrainIndex)];
+                                     static_cast<int>(definitions.size()) - 1);
+    gEditingTerrainIndex = std::max(minimumIndex, gEditingTerrainIndex);
+    const TerrainDefinition &terrain = definitions[static_cast<size_t>(gEditingTerrainIndex)];
     gModalFields = {terrain.name, std::to_string(TerrainColorByte(terrain.color.r)),
                     std::to_string(TerrainColorByte(terrain.color.g)),
                     std::to_string(TerrainColorByte(terrain.color.b))};
@@ -780,16 +1055,18 @@ void LoadTerrainEditorFields(int terrainIndex) {
 }
 
 void OpenTerrainEditor() {
+    gEditingDungeonTerrain = gEditorTab == EditorTab::Dungeon;
     OpenModal(ModalType::TerrainEditor, {});
-    LoadTerrainEditorFields(gBrush);
+    LoadTerrainEditorFields(gEditingDungeonTerrain ? gDungeonBrush : gBrush);
 }
 
 void StartNewTerrain() {
-    if (gTerrainDefinitions.size() >= kMaxTerrainTypes) {
+    std::vector<TerrainDefinition> &definitions = EditedTerrainDefinitions();
+    if (definitions.size() >= kMaxTerrainTypes) {
         LOG_WARN("Terrain limit reached (%d)", kMaxTerrainTypes);
         return;
     }
-    gEditingTerrainIndex = static_cast<int>(gTerrainDefinitions.size());
+    gEditingTerrainIndex = static_cast<int>(definitions.size());
     gModalFields = {"New Terrain", "128", "128", "128"};
     gModalField = 0;
     gCreatingTerrain = true;
@@ -814,6 +1091,32 @@ void OpenConfirmation(ConfirmAction action, const std::string &title,
 }
 
 void OpenKeybindHelp() {
+    if (gEditorTab == EditorTab::Dungeon) {
+        gInfoTitle = "DUNGEON MAPPER HELP";
+        gInfoLines = {
+            "DUNGEON TAB",
+            "LEFT / RIGHT DRAG    PAINT / ERASE THE ACTIVE LAYER",
+            "SHIFT + DRAG         FILL OR ERASE A RECTANGLE",
+            "MIDDLE DRAG          PAN THE DUNGEON MAP",
+            "MOUSE WHEEL          ZOOM AROUND THE CURSOR",
+            "F1-F7                BRUSH / FILL / LINE / CURVE / POLYGON / CIRCLE / SCATTER",
+            "T                    CYCLE TERRAIN / ELEVATION / FOG",
+            "[ / ] AND H          BRUSH SIZE AND ROUND / SQUARE SHAPE",
+            "Q / E                LOWER / RAISE THE ELEVATION BRUSH",
+            "E (NON-HEIGHT)       PLACE OR MOVE THE ENTRANCE",
+            "X                    PLACE OR MOVE THE EXIT",
+            "F11                  PREVIEW DUNGEON FOG AS A PLAYER",
+            "CTRL+Z / CTRL+Y      UNDO / REDO DUNGEON PAINTING",
+            "D                    EDIT DUNGEON NAME AND DESCRIPTION",
+            "HOME                 FIT THE DUNGEON MAP",
+            "G                    TOGGLE THE SQUARE GRID",
+            "CTRL+S / CTRL+L      SAVE / LOAD THE PROJECT",
+            "ESC                  RETURN TO THE WORLD TAB",
+            "ENTRANCE AND EXIT TOOLS ONLY EXIST IN THE DUNGEON TAB",
+        };
+        OpenModal(ModalType::Info, {});
+        return;
+    }
     gInfoTitle = "KEYBOARD & MOUSE HELP";
     gInfoLines = {
         "NAVIGATION",
@@ -840,6 +1143,7 @@ void OpenKeybindHelp() {
         "WORLD AND PROJECT",
         "M CITY   K POI   N NEW REGION   TAB CYCLE REGION",
         "V REGIONS   L LABELS   G GRID   Y HEX / SQUARE",
+        "CLICK DUNGEON POI TO CREATE OR OPEN ITS DUNGEON MAP",
         "CTRL+F FIND   CTRL+E PLACE ENCOUNTER   I WORLD INFO",
         "CLICK AN ENCOUNTER MARKER TO EDIT ITS DETAILS",
         "DELETE MARKER/SELECTION   X DELETE ROUTE",
@@ -956,6 +1260,7 @@ bool ShowMarkerInfoAtTile(int32_t col, int32_t row) {
     auto cityIt = std::find_if(gCities.begin(), gCities.end(),
                                [&](const City &city) { return city.col == col && city.row == row; });
     if (cityIt != gCities.end()) {
+        gSelectedDungeonPoiIndex = -1;
         gInfoTitle = "CITY DETAILS";
         gInfoLines = {"NAME: " + cityIt->name, "RULER: " + cityIt->ruler,
                       "TILE: " + std::to_string(col) + " " + std::to_string(row)};
@@ -965,6 +1270,12 @@ bool ShowMarkerInfoAtTile(int32_t col, int32_t row) {
     auto poiIt = std::find_if(gPois.begin(), gPois.end(),
                               [&](const PointOfInterest &poi) { return poi.col == col && poi.row == row; });
     if (poiIt != gPois.end()) {
+        int poiIndex = static_cast<int>(poiIt - gPois.begin());
+        if (poiIt->kind == PoiKind::Dungeon) {
+            OpenDungeonManagerForPoi(poiIndex);
+            return true;
+        }
+        gSelectedDungeonPoiIndex = -1;
         gInfoTitle = "POINT OF INTEREST";
         gInfoLines = {"TYPE: " + std::string(PoiKindName(poiIt->kind)), "NAME: " + poiIt->name};
         std::string details = poiIt->description.empty() ? "None" : poiIt->description;
@@ -1120,7 +1431,59 @@ void CloseModal(bool accept) {
         UpdateWindowTitle();
         return;
     }
+    if (gModalType == ModalType::DungeonManager) {
+        gModalType = ModalType::None;
+        UpdateWindowTitle();
+        return;
+    }
+    if (gModalType == ModalType::DungeonDetails) {
+        if (!accept) {
+            gModalType = ModalType::None;
+            gModalFields.clear();
+            gEditingDungeonIndex = -1;
+            UpdateWindowTitle();
+            return;
+        }
+        if (gModalFields.size() != 2) return;
+        int dungeonIndex = gEditingDungeonIndex;
+        bool creating = dungeonIndex < 0;
+        if (creating) {
+            Dungeon dungeon;
+            dungeon.worldCol = gModalCol;
+            dungeon.worldRow = gModalRow;
+            dungeon.name = gModalFields[0].empty() ? "Unnamed Dungeon" : gModalFields[0];
+            dungeon.description = gModalFields[1];
+            gDungeons.push_back(std::move(dungeon));
+            dungeonIndex = static_cast<int>(gDungeons.size()) - 1;
+            LOG_INFO("Created dungeon '%s' at world tile (%d, %d)",
+                     gDungeons.back().name.c_str(), gModalCol, gModalRow);
+        } else if (dungeonIndex < static_cast<int>(gDungeons.size())) {
+            Dungeon &dungeon = gDungeons[static_cast<size_t>(dungeonIndex)];
+            dungeon.name = gModalFields[0].empty() ? "Unnamed Dungeon" : gModalFields[0];
+            dungeon.description = gModalFields[1];
+            LOG_INFO("Updated dungeon '%s'", dungeon.name.c_str());
+        }
+        if (dungeonIndex >= 0 && dungeonIndex < static_cast<int>(gDungeons.size())) {
+            Dungeon &dungeon = gDungeons[static_cast<size_t>(dungeonIndex)];
+            int poiIndex = FindDungeonPoiAtWorldTile(dungeon.worldCol, dungeon.worldRow);
+            if (poiIndex >= 0) {
+                PointOfInterest &poi = gPois[static_cast<size_t>(poiIndex)];
+                poi.name = dungeon.name;
+                poi.description = dungeon.description;
+                gSelectedDungeonPoiIndex = poiIndex;
+            }
+        }
+        gModalType = ModalType::None;
+        gModalFields.clear();
+        gEditingDungeonIndex = -1;
+        ++gSceneRevision;
+        MarkProjectDirty();
+        if (creating) OpenDungeonTab(dungeonIndex);
+        else UpdateWindowTitle();
+        return;
+    }
     if (gModalType == ModalType::TerrainEditor) {
+        std::vector<TerrainDefinition> &definitions = EditedTerrainDefinitions();
         if (!accept) {
             gModalType = ModalType::None;
             gModalFields.clear();
@@ -1143,17 +1506,18 @@ void CloseModal(bool accept) {
             {red / 255.0f, green / 255.0f, blue / 255.0f},
         };
         if (gCreatingTerrain) {
-            gTerrainDefinitions.push_back(std::move(terrain));
-            gEditingTerrainIndex = static_cast<int>(gTerrainDefinitions.size()) - 1;
+            definitions.push_back(std::move(terrain));
+            gEditingTerrainIndex = static_cast<int>(definitions.size()) - 1;
             LOG_INFO("Created terrain #%d '%s'", gEditingTerrainIndex,
-                     gTerrainDefinitions.back().name.c_str());
+                     definitions.back().name.c_str());
         } else {
-            gTerrainDefinitions[static_cast<size_t>(gEditingTerrainIndex)] = std::move(terrain);
+            definitions[static_cast<size_t>(gEditingTerrainIndex)] = std::move(terrain);
             LOG_INFO("Updated terrain #%d '%s'", gEditingTerrainIndex,
-                     gTerrainDefinitions[static_cast<size_t>(gEditingTerrainIndex)].name.c_str());
+                     definitions[static_cast<size_t>(gEditingTerrainIndex)].name.c_str());
         }
-        gBrush = gEditingTerrainIndex;
-        gTerrainPage = gBrush / kTerrainPageSize;
+        if (gEditingDungeonTerrain) gDungeonBrush = gEditingTerrainIndex;
+        else gBrush = gEditingTerrainIndex;
+        gTerrainPage = gEditingTerrainIndex / kTerrainPageSize;
         gPaintMode = PaintMode::Terrain;
         gModalType = ModalType::None;
         gModalFields.clear();
@@ -1251,8 +1615,15 @@ void RemoveMarkerAtCursor() {
                                   return poi.col == col && poi.row == row;
                               });
     if (poiIt != gPois.end()) {
+        if (poiIt->kind == PoiKind::Dungeon && FindDungeonAtWorldTile(col, row) >= 0) {
+            LOG_WARN("Dungeon POI '%s' has a linked map and cannot be removed",
+                     poiIt->name.c_str());
+            return;
+        }
         LOG_INFO("Removed %s '%s'", PoiKindName(poiIt->kind), poiIt->name.c_str());
         gPois.erase(poiIt);
+        gSelectedDungeonPoiIndex = -1;
+        gDungeonManagerIndex = -1;
         ++gSceneRevision;
         MarkProjectDirty();
         return;
@@ -1300,6 +1671,12 @@ void PrintWorldInfo() {
     for (const auto &encounter : gEncounters) {
         LOG_INFO("  '%s' at (%d, %d)%s%s", encounter.name.c_str(), encounter.col, encounter.row,
                  encounter.description.empty() ? "" : " - ", encounter.description.c_str());
+    }
+    LOG_INFO("--- Dungeons (%zu) ---", gDungeons.size());
+    for (const auto &dungeon : gDungeons) {
+        LOG_INFO("  '%s' at world tile (%d, %d), %zu map tiles, entrance %s, exit %s",
+                 dungeon.name.c_str(), dungeon.worldCol, dungeon.worldRow, dungeon.tiles.size(),
+                 dungeon.hasEntrance ? "set" : "not set", dungeon.hasExit ? "set" : "not set");
     }
     LOG_INFO("--- Routes (%zu) ---", gRoutes.size());
     for (const auto &route : gRoutes) {
@@ -1379,6 +1756,24 @@ void ExportScreenshot() {
 }
 
 void UpdateWindowTitle() {
+    if (gEditorTab == EditorTab::Dungeon) {
+        Dungeon *dungeon = ActiveDungeon();
+        auto [col, row] = DungeonCursorTile();
+        char dungeonTitle[320];
+        std::string brushName = "Erase";
+        if (dungeon && gDungeonBrush >= 0 &&
+            gDungeonBrush < static_cast<int>(dungeon->terrainDefinitions.size()))
+            brushName = dungeon->terrainDefinitions[static_cast<size_t>(gDungeonBrush)].name;
+        std::snprintf(dungeonTitle, sizeof(dungeonTitle),
+                      "DND Map Drawer%s - Dungeon: %s | %s / %s | %s | Zoom: %.0f%% | Tile (%d, %d)",
+                      gProjectDirty ? " *" : "", dungeon ? dungeon->name.c_str() : "None",
+                      PaintModeName(gPaintMode),
+                      gPaintMode == PaintMode::Terrain ? brushName.c_str() :
+                      gPaintMode == PaintMode::Elevation ? ElevationEditModeName(gElevationEditMode) : "Fog",
+                      ToolName(gToolMode), gZoom * 100.0, col, row);
+        glfwSetWindowTitle(gWindow, dungeonTitle);
+        return;
+    }
     auto [col, row] = CursorTile();
     char title[320];
     const char *modeLabel = PaintModeName(gPaintMode);
@@ -1753,6 +2148,16 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
         gRedoStack.clear();
         gSelectionActive = false;
         gPlacementMode = PlacementMode::None;
+        if (gEditorTab == EditorTab::Dungeon) {
+            gCameraX = gWorldCameraX;
+            gCameraY = gWorldCameraY;
+            gZoom = gWorldZoom;
+        }
+        gEditorTab = EditorTab::World;
+        gActiveDungeonIndex = -1;
+        gSelectedDungeonPoiIndex = -1;
+        gDungeonManagerIndex = -1;
+        gDungeonPlacementMode = DungeonPlacementMode::None;
         gTileClipboard.clear();
         gPlayerView = false;
         gMeasureStage = 0;
@@ -1786,6 +2191,16 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
     gRedoStack.clear();
     gSelectionActive = false;
     gPlacementMode = PlacementMode::None;
+    if (gEditorTab == EditorTab::Dungeon) {
+        gCameraX = gWorldCameraX;
+        gCameraY = gWorldCameraY;
+        gZoom = gWorldZoom;
+    }
+    gEditorTab = EditorTab::World;
+    gActiveDungeonIndex = -1;
+    gSelectedDungeonPoiIndex = -1;
+    gDungeonManagerIndex = -1;
+    gDungeonPlacementMode = DungeonPlacementMode::None;
     gTileClipboard.clear();
     gPlayerView = false;
     gMeasureStage = 0;
@@ -1802,7 +2217,19 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
 
 void ClearActiveLayerNow() {
     size_t removed = 0;
-    if (gPaintMode == PaintMode::Terrain) {
+    Dungeon *dungeon = ActiveDungeon();
+    if (gEditorTab == EditorTab::Dungeon && dungeon) {
+        if (gPaintMode == PaintMode::Terrain) {
+            removed = dungeon->tiles.size();
+            dungeon->tiles.clear();
+        } else if (gPaintMode == PaintMode::Elevation) {
+            removed = dungeon->elevation.size();
+            dungeon->elevation.clear();
+        } else if (gPaintMode == PaintMode::Fog) {
+            removed = dungeon->fog.size();
+            dungeon->fog.clear();
+        }
+    } else if (gPaintMode == PaintMode::Terrain) {
         removed = gMapData.size();
         gMapData.clear();
     } else if (gPaintMode == PaintMode::Region) {
@@ -1829,21 +2256,23 @@ void RequestClearActiveLayer() {
 }
 
 void HideAllTerrainWithFog() {
-    if (gMapData.empty()) {
+    Dungeon *dungeon = ActiveDungeon();
+    const auto &terrain = gEditorTab == EditorTab::Dungeon && dungeon ? dungeon->tiles : gMapData;
+    if (terrain.empty()) {
         LOG_WARN("There are no terrain tiles to hide");
         return;
     }
     PaintMode previousMode = gPaintMode;
     gPaintMode = PaintMode::Fog;
-    BeginStroke(gMapData.size(), 1);
-    for (const auto &entry : gMapData) {
+    BeginStroke(terrain.size(), 1);
+    for (const auto &entry : terrain) {
         int32_t col = static_cast<int32_t>(entry.first >> 32);
         int32_t row = static_cast<int32_t>(entry.first & 0xFFFFFFFFu);
         SetTileRecorded(col, row, 1);
     }
     EndStroke();
     gPaintMode = previousMode;
-    LOG_INFO("Fogged all %zu terrain tiles", gMapData.size());
+    LOG_INFO("Fogged all %zu terrain tiles", terrain.size());
 }
 
 void GenerateTerrainRelief() {
@@ -2109,6 +2538,11 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
     AppendUiRect(vertices, kUiWidth - 2.0f, 0.0f, 2.0f, static_cast<float>(gWindowHeight),
                  {0.28f, 0.34f, 0.42f});
     AppendUiText(vertices, "MAP DRAWER", 12.0f, 12.0f, 2.5f, {0.90f, 0.76f, 0.35f});
+    bool dungeonPoiSelected = gSelectedDungeonPoiIndex >= 0 &&
+                              gSelectedDungeonPoiIndex < static_cast<int>(gPois.size()) &&
+                              gPois[static_cast<size_t>(gSelectedDungeonPoiIndex)].kind == PoiKind::Dungeon;
+    AddUiButton(vertices, kUiWidth - 132.0f, 8.0f, 58.0f, 24.0f, "DNG",
+                UiAction::OpenDungeons, 0, dungeonPoiSelected);
     AddUiButton(vertices, kUiWidth - 69.0f, 8.0f, 59.0f, 24.0f, "HELP", UiAction::Help);
 
     auto headingText = [&](const char *text, float y) { AppendUiText(vertices, text, 10.0f, y, 1.5f, heading); };
@@ -2290,7 +2724,8 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
     AppendUiText(vertices, "ZOOM " + std::to_string(static_cast<int>(gZoom * 100.0)) + " PERCENT",
                  10.0f, 736.0f, 1.5f, {0.85f, 0.87f, 0.90f}, 35);
     AppendUiText(vertices, "REGIONS " + std::to_string(gRegions.size()) + " CITIES " +
-                               std::to_string(gCities.size()),
+                               std::to_string(gCities.size()) + " DNG " +
+                               std::to_string(gDungeons.size()),
                  10.0f, 752.0f, 1.5f, {0.70f, 0.74f, 0.80f}, 35);
     AppendUiText(vertices, "POI " + std::to_string(gPois.size()) + " ENC " +
                                std::to_string(gEncounters.size()) + " ROUTES " +
@@ -2315,7 +2750,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                                                                            : "CLICK MAP FOR ENCOUNTER"),
                      10.0f, 864.0f, 1.5f, {0.95f, 0.65f, 0.30f}, 35);
 
-    if (gSelectionActive) {
+    if (gSelectionActive && gEditorTab == EditorTab::World) {
         float barX = kUiWidth + 12.0f, barY = 10.0f;
         AppendUiRect(vertices, barX - 6.0f, barY - 5.0f, 620.0f, 68.0f, {0.08f, 0.10f, 0.13f}, 0.96f);
         AppendUiText(vertices, "SELECTION " + std::to_string(SelectionTileCount()) + " TILES",
@@ -2330,21 +2765,177 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
             AddUiButton(vertices, barX + i * 67.0f, by, 62.0f, 28.0f, labels[i], actions[i]);
     }
 
+    if (gEditorTab == EditorTab::Dungeon) {
+        gUiHits.clear();
+        AppendUiRect(vertices, 0.0f, 0.0f, kUiWidth, static_cast<float>(gWindowHeight), panel, 1.0f);
+        AppendUiRect(vertices, kUiWidth - 2.0f, 0.0f, 2.0f, static_cast<float>(gWindowHeight),
+                     {0.28f, 0.34f, 0.42f});
+        AppendUiText(vertices, "DUNGEON", 12.0f, 12.0f, 2.5f, {0.88f, 0.34f, 0.18f});
+        AddUiButton(vertices, 116.0f, 8.0f, 62.0f, 24.0f, "WORLD", UiAction::DungeonReturnWorld);
+        AddUiButton(vertices, 183.0f, 8.0f, 71.0f, 24.0f, "HELP", UiAction::Help);
+
+        Dungeon *dungeon = ActiveDungeon();
+        std::string dungeonName = dungeon ? dungeon->name : "NO DUNGEON";
+        AppendUiText(vertices, dungeonName, 10.0f, 48.0f, 1.8f, {0.92f, 0.76f, 0.35f}, 32);
+        headingText("PAINT LAYER", 80.0f);
+        AddUiButton(vertices, x0, 96.0f, 78.0f, h, "TERRAIN", UiAction::SetMode,
+                    static_cast<int>(PaintMode::Terrain), gPaintMode == PaintMode::Terrain);
+        AddUiButton(vertices, x0 + 83.0f, 96.0f, 78.0f, h, "HEIGHT", UiAction::SetMode,
+                    static_cast<int>(PaintMode::Elevation), gPaintMode == PaintMode::Elevation);
+        AddUiButton(vertices, x0 + 166.0f, 96.0f, 78.0f, h, "FOG", UiAction::SetMode,
+                    static_cast<int>(PaintMode::Fog), gPaintMode == PaintMode::Fog);
+
+        headingText("TOOLS", 128.0f);
+        const ToolMode dungeonTools[] = {ToolMode::Brush, ToolMode::FloodFill, ToolMode::Line,
+                                         ToolMode::Curve, ToolMode::Polygon, ToolMode::Circle,
+                                         ToolMode::Scatter};
+        const char *dungeonToolLabels[] = {"BRUSH", "FILL", "LINE", "CURVE",
+                                           "POLY", "CIRCLE", "SCATTER"};
+        for (int i = 0; i < 7; ++i) {
+            float x = x0 + (i % 4) * 62.0f;
+            float y = 144.0f + (i / 4) * 28.0f;
+            AddUiButton(vertices, x, y, 57.0f, h, dungeonToolLabels[i], UiAction::SetTool,
+                        static_cast<int>(dungeonTools[i]), gToolMode == dungeonTools[i]);
+        }
+
+        headingText(gPaintMode == PaintMode::Elevation ? "ELEVATION LEVELS" : "DUNGEON TERRAIN",
+                    206.0f);
+        if (gPaintMode == PaintMode::Elevation) {
+            for (int elevation = kMinElevation; elevation <= kMaxElevation; ++elevation) {
+                int index = elevation - kMinElevation;
+                float x = x0 + (index % 7) * 35.0f;
+                float y = 222.0f + (index / 7) * 28.0f;
+                std::string label = elevation > 0 ? "+" + std::to_string(elevation)
+                                                  : std::to_string(elevation);
+                AddUiButton(vertices, x, y, 31.0f, h, label, UiAction::SetElevationValue,
+                            elevation, gElevationBrush == elevation);
+                Vec3 band = ElevationBandColor(elevation);
+                AppendUiRect(vertices, x + 3.0f, y + h - 5.0f, 25.0f, 3.0f, band);
+            }
+            const char *editLabels[] = {"SET", "RAISE", "LOWER", "FLAT", "AVG"};
+            for (int i = 0; i < 5; ++i)
+                AddUiButton(vertices, x0 + i * 50.0f, 278.0f, i == 4 ? 44.0f : 45.0f, h,
+                            editLabels[i], UiAction::SetElevationTool, i,
+                            static_cast<int>(gElevationEditMode) == i);
+        } else if (dungeon) {
+            int pageCount = std::max(1, (static_cast<int>(dungeon->terrainDefinitions.size()) +
+                                         kTerrainPageSize - 1) / kTerrainPageSize);
+            gTerrainPage = std::clamp(gTerrainPage, 0, pageCount - 1);
+            int firstTerrain = gTerrainPage * kTerrainPageSize;
+            for (int slot = 0; slot < kTerrainPageSize; ++slot) {
+                int terrainIndex = firstTerrain + slot;
+                if (terrainIndex >= static_cast<int>(dungeon->terrainDefinitions.size())) break;
+                float x = x0 + (slot % 3) * 83.0f;
+                float y = 222.0f + (slot / 3) * 28.0f;
+                const TerrainDefinition &terrain =
+                    dungeon->terrainDefinitions[static_cast<size_t>(terrainIndex)];
+                AddUiButton(vertices, x, y, 78.0f, h, terrain.name.substr(0, 8),
+                            terrainIndex == 0 ? UiAction::DungeonSetTile : UiAction::SetTerrain,
+                            terrainIndex, gPaintMode == PaintMode::Terrain &&
+                                              gDungeonBrush == terrainIndex);
+                AppendUiRect(vertices, x + 67.0f, y + 7.0f, 7.0f, 10.0f, terrain.color);
+            }
+            AddUiButton(vertices, x0, 306.0f, 31.0f, h, "<", UiAction::TerrainPagePrevious);
+            AddUiButton(vertices, x0 + 36.0f, 306.0f, 31.0f, h, ">", UiAction::TerrainPageNext);
+            AddUiButton(vertices, x0 + 73.0f, 306.0f, 78.0f, h, "EDIT", UiAction::EditTerrains);
+            AddUiButton(vertices, x0 + 156.0f, 306.0f, 88.0f, h, "NEW", UiAction::EditTerrains, 1);
+        }
+
+        headingText("BRUSH", 342.0f);
+        AddUiButton(vertices, x0, 358.0f, 52.0f, h, "-", UiAction::BrushDown);
+        AddUiButton(vertices, x0 + 57.0f, 358.0f, 72.0f, h,
+                    "SIZE " + std::to_string(gBrushRadius * 2 + 1), UiAction::None);
+        AddUiButton(vertices, x0 + 134.0f, 358.0f, 52.0f, h, "+", UiAction::BrushUp);
+        AddUiButton(vertices, x0 + 191.0f, 358.0f, 53.0f, h,
+                    gRoundBrush ? "ROUND" : "SQUARE", UiAction::ToggleShape, 0, gRoundBrush);
+
+        headingText("FOG AND HEIGHT VIEW", 390.0f);
+        AddUiButton(vertices, x0, 406.0f, 78.0f, h, "PLAYER", UiAction::TogglePlayerView, 0,
+                    gPlayerView);
+        AddUiButton(vertices, x0 + 83.0f, 406.0f, 78.0f, h, "ELEV VIEW",
+                    UiAction::ToggleElevationView, 0, gElevationView);
+        AddUiButton(vertices, x0 + 166.0f, 406.0f, 78.0f, h, "SHADE",
+                    UiAction::ToggleHillshade, 0, gShowHillshade);
+        AddUiButton(vertices, x0, 434.0f, 119.0f, h, "HIDE ALL", UiAction::FogHideAll);
+        AddUiButton(vertices, x0 + 124.0f, 434.0f, 120.0f, h, "REVEAL ALL", UiAction::FogRevealAll);
+
+        headingText("SPECIAL MARKERS", 472.0f);
+        AddUiButton(vertices, x0, 488.0f, 119.0f, h, "ENTRANCE", UiAction::DungeonPlaceEntrance,
+                    0, gDungeonPlacementMode == DungeonPlacementMode::Entrance);
+        AddUiButton(vertices, x0 + 124.0f, 488.0f, 120.0f, h, "EXIT", UiAction::DungeonPlaceExit,
+                    0, gDungeonPlacementMode == DungeonPlacementMode::Exit);
+        AppendUiText(vertices, dungeon && dungeon->hasEntrance ? "ENTRANCE SET" : "ENTRANCE NOT SET",
+                     x0, 518.0f, 1.4f, dungeon && dungeon->hasEntrance
+                                                   ? Vec3{0.38f, 0.90f, 0.46f}
+                                                   : Vec3{0.72f, 0.55f, 0.42f}, 24);
+        AppendUiText(vertices, dungeon && dungeon->hasExit ? "EXIT SET" : "EXIT NOT SET",
+                     x0 + 124.0f, 518.0f, 1.4f, dungeon && dungeon->hasExit
+                                                            ? Vec3{0.38f, 0.72f, 0.95f}
+                                                            : Vec3{0.72f, 0.55f, 0.42f}, 18);
+
+        headingText("DUNGEON", 546.0f);
+        AddUiButton(vertices, x0, 562.0f, 78.0f, h, "DETAILS", UiAction::DungeonEditDetails);
+        AddUiButton(vertices, x0 + 83.0f, 562.0f, 78.0f, h, "FIT", UiAction::DungeonFit);
+        AddUiButton(vertices, x0 + 166.0f, 562.0f, 78.0f, h, "GRID", UiAction::ToggleGrid, 0,
+                    gShowGrid);
+
+        headingText("PROJECT", 596.0f);
+        AddUiButton(vertices, x0, 612.0f, 78.0f, h, "SAVE", UiAction::Save);
+        AddUiButton(vertices, x0 + 83.0f, 612.0f, 78.0f, h, "LOAD", UiAction::Load);
+        AddUiButton(vertices, x0 + 166.0f, 612.0f, 78.0f, h, "CLEAR", UiAction::Clear);
+
+        headingText("STATUS", 650.0f);
+        const std::string brushName = dungeon && gDungeonBrush >= 0 &&
+                                              gDungeonBrush < static_cast<int>(dungeon->terrainDefinitions.size())
+                                          ? dungeon->terrainDefinitions[static_cast<size_t>(gDungeonBrush)].name
+                                          : "ERASE";
+        AppendUiText(vertices, std::string(PaintModeName(gPaintMode)) + " / " +
+                                   (gPaintMode == PaintMode::Terrain ? brushName :
+                                    gPaintMode == PaintMode::Elevation
+                                        ? ElevationEditModeName(gElevationEditMode) : "FOG"),
+                     x0, 668.0f, 1.5f, {0.85f, 0.87f, 0.90f}, 35);
+        AppendUiText(vertices, "MAP TILES " + std::to_string(dungeon ? dungeon->tiles.size() : 0),
+                     x0, 688.0f, 1.5f, {0.70f, 0.74f, 0.80f}, 35);
+        AppendUiText(vertices, "HEIGHT " + std::to_string(dungeon ? dungeon->elevation.size() : 0) +
+                                   " FOG " + std::to_string(dungeon ? dungeon->fog.size() : 0),
+                     x0, 708.0f, 1.5f, {0.70f, 0.74f, 0.80f}, 35);
+        AppendUiText(vertices, gProjectDirty ? "UNSAVED CHANGES" : "ALL CHANGES SAVED",
+                     x0, 728.0f, 1.5f,
+                     gProjectDirty ? Vec3{0.95f, 0.58f, 0.30f} : Vec3{0.45f, 0.78f, 0.52f}, 35);
+        if (gDungeonPlacementMode != DungeonPlacementMode::None)
+            AppendUiText(vertices, gDungeonPlacementMode == DungeonPlacementMode::Entrance
+                                       ? "CLICK MAP FOR ENTRANCE"
+                                       : "CLICK MAP FOR EXIT",
+                         x0, 750.0f, 1.5f, {0.95f, 0.65f, 0.30f}, 35);
+
+        auto [dungeonCol, dungeonRow] = DungeonWorldToTile(gLastCanvasWorldX, gLastCanvasWorldY);
+        std::string dungeonCoordinates =
+            "DUNGEON TILE " + std::to_string(dungeonCol) + "  " + std::to_string(dungeonRow);
+        AppendUiRect(vertices, badgeX, badgeY, badgeWidth, 30.0f,
+                     {0.07f, 0.09f, 0.12f}, 1.0f);
+        AppendUiText(vertices, dungeonCoordinates, badgeX + 10.0f, badgeY + 10.0f, 1.7f,
+                     {0.95f, 0.48f, 0.25f}, 34);
+        gUiHits.push_back({badgeX, badgeY, badgeWidth, 30.0f, UiAction::None, 0});
+    }
+
     if (gModalType != ModalType::None) {
         gUiHits.clear();
         AppendUiRect(vertices, 0.0f, 0.0f, static_cast<float>(gWindowWidth),
                      static_cast<float>(gWindowHeight), {0.01f, 0.01f, 0.02f}, 0.72f);
         const bool keybindHelp =
-            gModalType == ModalType::Info && gInfoTitle == "KEYBOARD & MOUSE HELP";
+            gModalType == ModalType::Info &&
+            (gInfoTitle == "KEYBOARD & MOUSE HELP" || gInfoTitle == "DUNGEON MAPPER HELP");
         float mw = keybindHelp ? std::min(760.0f, static_cast<float>(gWindowWidth) - 60.0f)
                                : 560.0f;
         float mh = keybindHelp
                        ? std::min(760.0f, static_cast<float>(gWindowHeight) - 60.0f)
+                       : (gModalType == ModalType::DungeonManager
+                              ? 330.0f
                        : (gModalType == ModalType::TerrainEditor
                               ? 420.0f
                        : ((gModalType == ModalType::Info || gModalType == ModalType::Confirm)
                               ? 320.0f
-                              : (gModalFields.size() > 1 ? 290.0f : 220.0f)));
+                              : (gModalFields.size() > 1 ? 290.0f : 220.0f))));
         float mx = (gWindowWidth - mw) * 0.5f, my = (gWindowHeight - mh) * 0.5f;
         AppendUiRect(vertices, mx, my, mw, mh, {0.10f, 0.12f, 0.16f});
         AppendUiRect(vertices, mx, my, mw, 4.0f, {0.75f, 0.57f, 0.20f});
@@ -2354,22 +2945,61 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                             gModalType == ModalType::Encounter
                                 ? (gEditingEncounterIndex >= 0 ? "EDIT ENCOUNTER" : "NEW ENCOUNTER") :
                             gModalType == ModalType::TerrainEditor ? "TERRAIN EDITOR" :
+                            gModalType == ModalType::DungeonManager ? "DUNGEON MANAGER" :
+                            gModalType == ModalType::DungeonDetails
+                                ? (gEditingDungeonIndex >= 0 ? "EDIT DUNGEON" : "NEW DUNGEON") :
                             gModalType == ModalType::Info ? gInfoTitle.c_str() :
                             gModalType == ModalType::Confirm ? gInfoTitle.c_str() :
                             gModalType == ModalType::ProjectName ? "PROJECT FILE" :
                             gModalType == ModalType::Search ? "FIND ON MAP" : "NAME ROUTE";
         AppendUiText(vertices, title, mx + 24.0f, my + 24.0f, 2.5f, {0.95f, 0.82f, 0.42f});
         if (gModalType == ModalType::City || gModalType == ModalType::Poi ||
-            gModalType == ModalType::Encounter)
+            gModalType == ModalType::Encounter || gModalType == ModalType::DungeonDetails)
             AppendUiText(vertices, "TILE " + std::to_string(gModalCol) + " " + std::to_string(gModalRow),
                          mx + 350.0f, my + 29.0f, 1.5f, {0.72f, 0.77f, 0.84f}, 24);
-        if (gModalType == ModalType::Info) {
+        if (gModalType == ModalType::DungeonManager) {
+            bool hasMap = gDungeonManagerIndex >= 0 &&
+                          gDungeonManagerIndex < static_cast<int>(gDungeons.size());
+            const PointOfInterest *selectedPoi =
+                gSelectedDungeonPoiIndex >= 0 &&
+                        gSelectedDungeonPoiIndex < static_cast<int>(gPois.size())
+                    ? &gPois[static_cast<size_t>(gSelectedDungeonPoiIndex)]
+                    : nullptr;
+            if (hasMap) {
+                const Dungeon &dungeon = gDungeons[static_cast<size_t>(gDungeonManagerIndex)];
+                AppendUiText(vertices, dungeon.name, mx + 24.0f, my + 76.0f, 2.2f,
+                             {0.92f, 0.76f, 0.35f}, 46);
+                AppendUiText(vertices, "WORLD TILE " + std::to_string(dungeon.worldCol) + " " +
+                                               std::to_string(dungeon.worldRow),
+                             mx + 24.0f, my + 112.0f, 1.6f, {0.72f, 0.77f, 0.84f}, 48);
+                AppendUiText(vertices, "MAP TILES " + std::to_string(dungeon.tiles.size()) +
+                                               "   ENTRANCE " + (dungeon.hasEntrance ? "SET" : "NOT SET") +
+                                               "   EXIT " + (dungeon.hasExit ? "SET" : "NOT SET"),
+                             mx + 24.0f, my + 142.0f, 1.5f, {0.82f, 0.85f, 0.90f}, 68);
+                std::string details = dungeon.description.empty() ? "NO DESCRIPTION" : dungeon.description;
+                AppendUiText(vertices, details, mx + 24.0f, my + 174.0f, 1.5f,
+                             {0.70f, 0.74f, 0.80f}, 68);
+            } else {
+                AppendUiText(vertices, selectedPoi ? selectedPoi->name : "DUNGEON POI",
+                             mx + 24.0f, my + 76.0f, 2.2f, {0.92f, 0.76f, 0.35f}, 46);
+                AppendUiText(vertices, "THIS DUNGEON POI DOES NOT HAVE A MAP YET",
+                             mx + 24.0f, my + 122.0f, 1.6f, {0.78f, 0.80f, 0.84f}, 62);
+                AppendUiText(vertices, "CREATE MAP TO OPEN ITS DEDICATED DUNGEON TAB",
+                             mx + 24.0f, my + 156.0f, 1.5f, {0.62f, 0.68f, 0.76f}, 62);
+            }
+            AddUiButton(vertices, mx + 24.0f, my + mh - 48.0f, 118.0f, 28.0f,
+                        hasMap ? "OPEN MAP" : "CREATE MAP",
+                        hasMap ? UiAction::DungeonManagerOpen : UiAction::DungeonManagerNew);
+            AddUiButton(vertices, mx + mw - 112.0f, my + mh - 48.0f, 88.0f, 28.0f,
+                        "CLOSE", UiAction::ModalCancel);
+        } else if (gModalType == ModalType::Info) {
             const float lineSpacing = keybindHelp ? 20.0f : 34.0f;
             for (size_t i = 0; i < gInfoLines.size(); ++i) {
                 const bool sectionHeading =
                     keybindHelp && (gInfoLines[i] == "NAVIGATION" || gInfoLines[i] == "PAINTING" ||
                                     gInfoLines[i] == "TOOLS" ||
-                                    gInfoLines[i] == "WORLD AND PROJECT");
+                                    gInfoLines[i] == "WORLD AND PROJECT" ||
+                                    gInfoLines[i] == "DUNGEON TAB");
                 const float textScale = keybindHelp ? (sectionHeading ? 1.65f : 1.45f) : 1.8f;
                 const Vec3 textColor = sectionHeading ? Vec3{0.90f, 0.76f, 0.35f}
                                                       : Vec3{0.88f, 0.90f, 0.94f};
@@ -2401,6 +3031,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                 }
             }
             if (gModalType == ModalType::TerrainEditor) {
+                const std::vector<TerrainDefinition> &definitions = EditedTerrainDefinitions();
                 fieldLabels[1] = "RED 0-255";
                 fieldLabels[2] = "GREEN 0-255";
                 fieldLabels[3] = "BLUE 0-255";
@@ -2412,8 +3043,8 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                             UiAction::ModalTerrainNew);
                 std::string terrainPosition = gCreatingTerrain
                                                   ? "NEW TERRAIN"
-                                                  : "TERRAIN " + std::to_string(gEditingTerrainIndex + 1) +
-                                                        " OF " + std::to_string(gTerrainDefinitions.size());
+                                                   : "TERRAIN " + std::to_string(gEditingTerrainIndex + 1) +
+                                                         " OF " + std::to_string(definitions.size());
                 AppendUiText(vertices, terrainPosition, mx + 286.0f, my + 67.0f, 1.5f,
                              {0.72f, 0.77f, 0.84f}, 30);
                 int previewRed = 0, previewGreen = 0, previewBlue = 0;
@@ -2456,6 +3087,8 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                         gModalType == ModalType::ProjectName ? "APPLY" :
                         gModalType == ModalType::Search ? "FIND" :
                         gModalType == ModalType::TerrainEditor ? (gCreatingTerrain ? "CREATE" : "SAVE") :
+                        gModalType == ModalType::DungeonDetails
+                            ? (gEditingDungeonIndex >= 0 ? "SAVE" : "CREATE") :
                         (gModalType == ModalType::Encounter && gEditingEncounterIndex >= 0)
                             ? "SAVE" : "CREATE",
                         UiAction::ModalAccept);
@@ -2474,11 +3107,20 @@ void HandleUiAction(const UiHit &hit) {
     gUseUiTarget = true;
     switch (hit.action) {
         case UiAction::None: break;
-        case UiAction::SetMode: gPaintMode = static_cast<PaintMode>(hit.value); break;
+        case UiAction::SetMode:
+            gPaintMode = static_cast<PaintMode>(hit.value);
+            gDungeonPlacementMode = DungeonPlacementMode::None;
+            break;
         case UiAction::SetTool: SelectTool(static_cast<ToolMode>(hit.value)); break;
         case UiAction::SetTerrain:
-            gBrush = std::clamp(hit.value, 0, static_cast<int>(gTerrainDefinitions.size()) - 1);
-            gTerrainPage = gBrush / kTerrainPageSize;
+            if (gEditorTab == EditorTab::Dungeon) {
+                gDungeonBrush = std::clamp(hit.value, 1,
+                    static_cast<int>(ActiveTerrainDefinitions().size()) - 1);
+                gTerrainPage = gDungeonBrush / kTerrainPageSize;
+            } else {
+                gBrush = std::clamp(hit.value, 0, static_cast<int>(gTerrainDefinitions.size()) - 1);
+                gTerrainPage = gBrush / kTerrainPageSize;
+            }
             gPaintMode = PaintMode::Terrain;
             break;
         case UiAction::EditTerrains:
@@ -2486,14 +3128,14 @@ void HandleUiAction(const UiHit &hit) {
             if (hit.value != 0) StartNewTerrain();
             break;
         case UiAction::TerrainPagePrevious: {
-            int pageCount = std::max(1, (static_cast<int>(gTerrainDefinitions.size()) +
+            int pageCount = std::max(1, (static_cast<int>(ActiveTerrainDefinitions().size()) +
                                          kTerrainPageSize - 1) /
                                             kTerrainPageSize);
             gTerrainPage = (gTerrainPage + pageCount - 1) % pageCount;
             break;
         }
         case UiAction::TerrainPageNext: {
-            int pageCount = std::max(1, (static_cast<int>(gTerrainDefinitions.size()) +
+            int pageCount = std::max(1, (static_cast<int>(ActiveTerrainDefinitions().size()) +
                                          kTerrainPageSize - 1) /
                                             kTerrainPageSize);
             gTerrainPage = (gTerrainPage + 1) % pageCount;
@@ -2526,6 +3168,7 @@ void HandleUiAction(const UiHit &hit) {
             LOG_INFO("POI placement: %s", gPlacementMode == PlacementMode::Poi ? "click a map tile" : "cancelled");
             break;
         case UiAction::NewEncounter: ToggleEncounterPlacement(); break;
+        case UiAction::OpenDungeons: OpenDungeonManager(); break;
         case UiAction::DeleteMarker: RemoveMarkerAtCursor(); break;
         case UiAction::DeleteRoute: RemoveRouteAtCursor(); break;
         case UiAction::WorldInfo: PrintWorldInfo(); break;
@@ -2557,6 +3200,7 @@ void HandleUiAction(const UiHit &hit) {
             LOG_INFO("Player view: %s", gPlayerView ? "on" : "off"); break;
         case UiAction::FogHideAll: HideAllTerrainWithFog(); break;
         case UiAction::FogRevealAll:
+            gPaintMode = PaintMode::Fog;
             OpenConfirmation(ConfirmAction::ClearLayer, "REVEAL ENTIRE MAP",
                              {"REMOVE ALL FOG OF WAR?", "THIS ACTION CAN BE UNDONE FROM A BACKUP"});
             break;
@@ -2587,14 +3231,41 @@ void HandleUiAction(const UiHit &hit) {
         case UiAction::ModalPoiKind:
             gModalPoiKind = static_cast<PoiKind>(std::clamp(hit.value, 0, kPoiKindCount - 1)); break;
         case UiAction::ModalTerrainPrevious:
-            LoadTerrainEditorFields((gCreatingTerrain ? static_cast<int>(gTerrainDefinitions.size())
-                                                      : gEditingTerrainIndex) -
+            LoadTerrainEditorFields((gCreatingTerrain ? static_cast<int>(EditedTerrainDefinitions().size())
+                                                       : gEditingTerrainIndex) -
                                     1);
             break;
         case UiAction::ModalTerrainNext:
             LoadTerrainEditorFields((gCreatingTerrain ? -1 : gEditingTerrainIndex) + 1);
             break;
         case UiAction::ModalTerrainNew: StartNewTerrain(); break;
+        case UiAction::DungeonReturnWorld: ReturnToWorldTab(); break;
+        case UiAction::DungeonSetTile:
+            gDungeonBrush = std::clamp(hit.value, 0,
+                static_cast<int>(ActiveTerrainDefinitions().size()) - 1);
+            gPaintMode = PaintMode::Terrain;
+            gDungeonPlacementMode = DungeonPlacementMode::None;
+            break;
+        case UiAction::DungeonPlaceEntrance:
+            gDungeonPlacementMode = gDungeonPlacementMode == DungeonPlacementMode::Entrance
+                                        ? DungeonPlacementMode::None
+                                        : DungeonPlacementMode::Entrance;
+            break;
+        case UiAction::DungeonPlaceExit:
+            gDungeonPlacementMode = gDungeonPlacementMode == DungeonPlacementMode::Exit
+                                        ? DungeonPlacementMode::None
+                                        : DungeonPlacementMode::Exit;
+            break;
+        case UiAction::DungeonFit: FitDungeonToWindow(); break;
+        case UiAction::DungeonEditDetails: OpenDungeonDetailsForm(); break;
+        case UiAction::DungeonManagerOpen:
+            if (gDungeonManagerIndex >= 0 &&
+                gDungeonManagerIndex < static_cast<int>(gDungeons.size())) {
+                gModalType = ModalType::None;
+                OpenDungeonTab(gDungeonManagerIndex);
+            }
+            break;
+        case UiAction::DungeonManagerNew: OpenNewDungeonForm(); break;
     }
     gUseUiTarget = false;
     UpdateWindowTitle();
@@ -2628,7 +3299,9 @@ void CharacterCallback(GLFWwindow * /*window*/, unsigned int codepoint) {
         (codepoint < '0' || codepoint > '9'))
         return;
     size_t limit = 80;
-    if (gModalType == ModalType::Encounter && gModalField == 1) limit = 240;
+    if ((gModalType == ModalType::Encounter || gModalType == ModalType::DungeonDetails) &&
+        gModalField == 1)
+        limit = 240;
     else if (gModalType == ModalType::TerrainEditor && gModalField > 0) limit = 3;
     if (codepoint >= 32 && codepoint <= 126 && gModalFields[gModalField].size() < limit) {
         gModalFields[gModalField].push_back(static_cast<char>(codepoint));
@@ -2659,6 +3332,14 @@ void MouseButtonCallback(GLFWwindow * /*window*/, int button, int action, int mo
         gPaintingRight = false;
         return;
     }
+    if (gEditorTab == EditorTab::Dungeon) {
+        if (gDungeonPlacementMode != DungeonPlacementMode::None && action == GLFW_PRESS) {
+            if (button == GLFW_MOUSE_BUTTON_LEFT) PlaceDungeonSpecialAtCursor();
+            else if (button == GLFW_MOUSE_BUTTON_RIGHT)
+                gDungeonPlacementMode = DungeonPlacementMode::None;
+            return;
+        }
+    }
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         if (action == GLFW_PRESS) {
             if (gPlacementMode == PlacementMode::City) {
@@ -2684,7 +3365,7 @@ void MouseButtonCallback(GLFWwindow * /*window*/, int button, int action, int mo
                     gMeasureStartRow = gMeasureEndRow = row;
                     gMeasureStage = 1;
                 }
-            } else if (ShowMarkerInfoAtCursor()) {
+            } else if (gEditorTab == EditorTab::World && ShowMarkerInfoAtCursor()) {
                 // Marker clicks open their read-only information card instead of painting through them.
             } else if (gToolMode == ToolMode::Selection) {
                 gSelectionDragging = true;
@@ -2882,6 +3563,7 @@ void ScrollCallback(GLFWwindow * /*window*/, double /*xoffset*/, double yoffset)
 void SelectTool(ToolMode mode) {
     gToolMode = mode;
     gPlacementMode = PlacementMode::None;
+    gDungeonPlacementMode = DungeonPlacementMode::None;
     gCurveStage = 0;
     gPolygonPoints.clear();
     gRoutePoints.clear();
@@ -2896,6 +3578,19 @@ void SelectTool(ToolMode mode) {
 void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int mods) {
     if (gModalType != ModalType::None) {
         if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+        if (gModalType == ModalType::DungeonManager) {
+            if (key == GLFW_KEY_ESCAPE) CloseModal(false);
+            else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
+                if (gDungeonManagerIndex >= 0 &&
+                    gDungeonManagerIndex < static_cast<int>(gDungeons.size())) {
+                    gModalType = ModalType::None;
+                    OpenDungeonTab(gDungeonManagerIndex);
+                } else {
+                    OpenNewDungeonForm();
+                }
+            }
+            return;
+        }
         if (gModalType == ModalType::Info) {
             if (key == GLFW_KEY_ESCAPE || key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER ||
                 key == GLFW_KEY_SPACE)
@@ -2924,6 +3619,57 @@ void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int 
         return;
     }
     if (action != GLFW_PRESS) return;
+
+    if (gEditorTab == EditorTab::Dungeon) {
+        if (key == GLFW_KEY_S && (mods & GLFW_MOD_CONTROL)) RequestProjectSave();
+        else if (key == GLFW_KEY_L && (mods & GLFW_MOD_CONTROL)) RequestProjectLoad();
+        else if (key == GLFW_KEY_Z && (mods & GLFW_MOD_CONTROL)) Undo();
+        else if (key == GLFW_KEY_Y && (mods & GLFW_MOD_CONTROL)) Redo();
+        else if (key == GLFW_KEY_SLASH && (mods & GLFW_MOD_SHIFT)) OpenKeybindHelp();
+        else if (key == GLFW_KEY_ESCAPE) ReturnToWorldTab();
+        else if (key == GLFW_KEY_HOME) FitDungeonToWindow();
+        else if (key == GLFW_KEY_G) gShowGrid = !gShowGrid;
+        else if (key == GLFW_KEY_D) OpenDungeonDetailsForm();
+        else if (key == GLFW_KEY_E && gPaintMode != PaintMode::Elevation) {
+            gDungeonPlacementMode = DungeonPlacementMode::Entrance;
+        } else if (key == GLFW_KEY_X) {
+            gDungeonPlacementMode = DungeonPlacementMode::Exit;
+        } else if ((key == GLFW_KEY_Q || key == GLFW_KEY_E) &&
+                   gPaintMode == PaintMode::Elevation) {
+            gElevationBrush = std::clamp(gElevationBrush + (key == GLFW_KEY_Q ? -1 : 1),
+                                         kMinElevation, kMaxElevation);
+            gElevationEditMode = ElevationEditMode::Set;
+        } else if (key == GLFW_KEY_T) {
+            gPaintMode = gPaintMode == PaintMode::Terrain ? PaintMode::Elevation
+                       : gPaintMode == PaintMode::Elevation ? PaintMode::Fog
+                                                            : PaintMode::Terrain;
+        } else if (key == GLFW_KEY_F11) {
+            gPlayerView = !gPlayerView;
+            ++gSceneRevision;
+        } else if (key == GLFW_KEY_H) {
+            gRoundBrush = !gRoundBrush;
+        } else if (key == GLFW_KEY_LEFT_BRACKET) {
+            gBrushRadius = std::max(0, gBrushRadius - 1);
+        } else if (key == GLFW_KEY_RIGHT_BRACKET) {
+            gBrushRadius = std::min(kMaxBrushRadius, gBrushRadius + 1);
+        } else if (key == GLFW_KEY_C) {
+            RequestClearActiveLayer();
+        } else if (key == GLFW_KEY_F1) SelectTool(ToolMode::Brush);
+        else if (key == GLFW_KEY_F2 || key == GLFW_KEY_F) SelectTool(ToolMode::FloodFill);
+        else if (key == GLFW_KEY_F3) SelectTool(ToolMode::Line);
+        else if (key == GLFW_KEY_F4) SelectTool(ToolMode::Curve);
+        else if (key == GLFW_KEY_F5) SelectTool(ToolMode::Polygon);
+        else if (key == GLFW_KEY_F6) SelectTool(ToolMode::Circle);
+        else if (key == GLFW_KEY_F7) SelectTool(ToolMode::Scatter);
+        else if (key >= GLFW_KEY_0 && key <= GLFW_KEY_9 &&
+                 key - GLFW_KEY_0 < static_cast<int>(ActiveTerrainDefinitions().size())) {
+            gDungeonBrush = key - GLFW_KEY_0;
+            gPaintMode = PaintMode::Terrain;
+            gDungeonPlacementMode = DungeonPlacementMode::None;
+        }
+        UpdateWindowTitle();
+        return;
+    }
 
     if (key == GLFW_KEY_SLASH && (mods & GLFW_MOD_SHIFT)) {
         OpenKeybindHelp();
@@ -3100,9 +3846,10 @@ void AppendTileTriangles(std::vector<float> &vertices, int32_t col, int32_t row,
         vertices.insert(vertices.end(), std::begin(quad), std::end(quad));
         return;
     }
-    int cornerCount = gHexGrid ? 6 : 4;
+    bool hexGrid = gEditorTab == EditorTab::World && gHexGrid;
+    int cornerCount = hexGrid ? 6 : 4;
     std::array<std::pair<float, float>, 6> corners{};
-    if (gHexGrid) {
+    if (hexGrid) {
         float radius = static_cast<float>(kTileSize * 0.5 * gZoom);
         for (int i = 0; i < cornerCount; ++i) {
             double angle = i * kPi / 3.0;
@@ -3132,9 +3879,10 @@ void AppendTileOutline(std::vector<float> &vertices, int32_t col, int32_t row,
     auto [worldCx, worldCy] = TileCenterWorld(col, row);
     float cx = static_cast<float>((worldCx - gCameraX) * gZoom);
     float cy = static_cast<float>((worldCy - gCameraY) * gZoom);
-    int cornerCount = gHexGrid ? 6 : 4;
+    bool hexGrid = gEditorTab == EditorTab::World && gHexGrid;
+    int cornerCount = hexGrid ? 6 : 4;
     std::array<std::pair<float, float>, 6> corners{};
-    if (gHexGrid) {
+    if (hexGrid) {
         float radius = static_cast<float>(kTileSize * 0.5 * gZoom);
         for (int i = 0; i < cornerCount; ++i) {
             double angle = i * kPi / 3.0;
@@ -3179,6 +3927,121 @@ void ForEachVisibleStoredTile(const Layer &layer, int32_t minCol, int32_t minRow
             }
         }
     }
+}
+
+void DungeonVisibleBounds(int32_t &minCol, int32_t &minRow, int32_t &maxCol, int32_t &maxRow) {
+    grid_geometry::BoundsForWorldRect(gCameraX, gCameraY, gCameraX + gWindowWidth / gZoom,
+                                      gCameraY + gWindowHeight / gZoom, false,
+                                      minCol, minRow, maxCol, maxRow);
+}
+
+void AppendDungeonTile(std::vector<float> &vertices, int32_t col, int32_t row, Vec3 color) {
+    float x = static_cast<float>((col * kTileSize - gCameraX) * gZoom);
+    float y = static_cast<float>((row * kTileSize - gCameraY) * gZoom);
+    float size = static_cast<float>(kTileSize * gZoom);
+    AppendUiRect(vertices, x, y, size, size, color);
+}
+
+void RebuildDungeonTileMesh(GLuint vbo, GLsizei &outVertexCount) {
+    std::vector<float> vertices;
+    Dungeon *dungeon = ActiveDungeon();
+    if (dungeon) {
+        int32_t minCol = 0, minRow = 0, maxCol = 0, maxRow = 0;
+        DungeonVisibleBounds(minCol, minRow, maxCol, maxRow);
+        auto dungeonElevation = [&](int32_t col, int32_t row) {
+            auto it = dungeon->elevation.find(TileKey(col, row));
+            return it == dungeon->elevation.end() ? 0 : static_cast<int>(it->second);
+        };
+        for (const auto &[key, value] : dungeon->tiles) {
+            auto [col, row] = TileCoords(key);
+            if (col < minCol || col > maxCol || row < minRow || row > maxRow) continue;
+            size_t terrainIndex = std::min(static_cast<size_t>(value),
+                                           dungeon->terrainDefinitions.size() - 1);
+            int elevation = dungeonElevation(col, row);
+            Vec3 baseColor = gElevationView ? ElevationBandColor(elevation)
+                                            : dungeon->terrainDefinitions[terrainIndex].color;
+            float brightness = gElevationView ? 1.0f : 1.0f + elevation * 0.075f;
+            float shade = 1.0f;
+            if (gShowHillshade) {
+                int northwest = dungeonElevation(col - 1, row - 1);
+                int southeast = dungeonElevation(col + 1, row + 1);
+                shade = std::clamp(1.0f + static_cast<float>(northwest - southeast) * 0.075f,
+                                   0.62f, 1.35f);
+            }
+            Vec3 color{std::clamp(baseColor.r * brightness * shade, 0.0f, 1.0f),
+                       std::clamp(baseColor.g * brightness * shade, 0.0f, 1.0f),
+                       std::clamp(baseColor.b * brightness * shade, 0.0f, 1.0f)};
+            AppendDungeonTile(vertices, col, row, color);
+        }
+        auto appendSpecial = [&](int32_t col, int32_t row, bool entrance) {
+            float x = static_cast<float>((col * kTileSize - gCameraX) * gZoom);
+            float y = static_cast<float>((row * kTileSize - gCameraY) * gZoom);
+            float size = static_cast<float>(kTileSize * gZoom);
+            float inset = size * 0.18f;
+            Vec3 color = entrance ? Vec3{0.15f, 0.95f, 0.28f} : Vec3{0.12f, 0.65f, 1.0f};
+            AppendUiRect(vertices, x + inset, y + inset, size - inset * 2.0f,
+                         size - inset * 2.0f, color);
+            AppendUiRect(vertices, x + inset * 1.65f, y + inset * 1.65f,
+                         size - inset * 3.3f, size - inset * 3.3f, {0.04f, 0.05f, 0.06f});
+        };
+        if (dungeon->hasEntrance)
+            appendSpecial(dungeon->entranceCol, dungeon->entranceRow, true);
+        if (dungeon->hasExit) appendSpecial(dungeon->exitCol, dungeon->exitRow, false);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+                 vertices.data(), GL_DYNAMIC_DRAW);
+    outVertexCount = static_cast<GLsizei>(vertices.size() / 6);
+}
+
+void RebuildDungeonFogOverlay(GLuint vbo, GLsizei &outVertexCount) {
+    std::vector<float> vertices;
+    Dungeon *dungeon = ActiveDungeon();
+    if (dungeon) {
+        int32_t minCol = 0, minRow = 0, maxCol = 0, maxRow = 0;
+        DungeonVisibleBounds(minCol, minRow, maxCol, maxRow);
+        ForEachVisibleStoredTile(dungeon->fog, minCol, minRow, maxCol, maxRow,
+            [&](int32_t col, int32_t row, uint8_t /*hidden*/) {
+                float x = static_cast<float>((col * kTileSize - gCameraX) * gZoom);
+                float y = static_cast<float>((row * kTileSize - gCameraY) * gZoom);
+                float size = static_cast<float>(kTileSize * gZoom);
+                AppendUiRect(vertices, x, y, size, size, {0.015f, 0.018f, 0.025f},
+                             gPlayerView ? 0.985f : 0.58f);
+            });
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+                 vertices.data(), GL_DYNAMIC_DRAW);
+    outVertexCount = static_cast<GLsizei>(vertices.size() / 6);
+}
+
+void RebuildDungeonGrid(GLuint vbo, GLsizei &outVertexCount) {
+    std::vector<float> vertices;
+    int32_t minCol = 0, minRow = 0, maxCol = 0, maxRow = 0;
+    DungeonVisibleBounds(minCol, minRow, maxCol, maxRow);
+    auto addLine = [&](double worldX0, double worldY0, double worldX1, double worldY1) {
+        float x0 = static_cast<float>((worldX0 - gCameraX) * gZoom);
+        float y0 = static_cast<float>((worldY0 - gCameraY) * gZoom);
+        float x1 = static_cast<float>((worldX1 - gCameraX) * gZoom);
+        float y1 = static_cast<float>((worldY1 - gCameraY) * gZoom);
+        const float line[] = {x0, y0, 0.24f, 0.27f, 0.31f, 0.72f,
+                              x1, y1, 0.24f, 0.27f, 0.31f, 0.72f};
+        vertices.insert(vertices.end(), std::begin(line), std::end(line));
+    };
+    double left = static_cast<double>(minCol) * kTileSize;
+    double right = static_cast<double>(maxCol + 1) * kTileSize;
+    double top = static_cast<double>(minRow) * kTileSize;
+    double bottom = static_cast<double>(maxRow + 1) * kTileSize;
+    for (int32_t col = minCol; col <= maxCol + 1; ++col)
+        addLine(static_cast<double>(col) * kTileSize, top,
+                static_cast<double>(col) * kTileSize, bottom);
+    for (int32_t row = minRow; row <= maxRow + 1; ++row)
+        addLine(left, static_cast<double>(row) * kTileSize, right,
+                static_cast<double>(row) * kTileSize);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+                 vertices.data(), GL_DYNAMIC_DRAW);
+    outVertexCount = static_cast<GLsizei>(vertices.size() / 6);
 }
 
 // Rebuilds the tile mesh for only the currently visible tiles.
@@ -3519,6 +4382,30 @@ void AppendLabelText(std::vector<float> &vertices, const std::string &text, doub
     }
 }
 
+void RebuildDungeonElevationLabels(GLuint vbo, GLsizei &outVertexCount) {
+    std::vector<float> vertices;
+    Dungeon *dungeon = ActiveDungeon();
+    if (dungeon && gElevationView && kTileSize * gZoom >= 20.0) {
+        int32_t minCol = 0, minRow = 0, maxCol = 0, maxRow = 0;
+        DungeonVisibleBounds(minCol, minRow, maxCol, maxRow);
+        ForEachVisibleStoredTile(dungeon->tiles, minCol, minRow, maxCol, maxRow,
+            [&](int32_t col, int32_t row, uint8_t /*terrain*/) {
+                auto elevationIt = dungeon->elevation.find(TileKey(col, row));
+                int elevation = elevationIt == dungeon->elevation.end() ? 0 : elevationIt->second;
+                auto [worldX, worldY] = TileCenterWorld(col, row);
+                std::string label = elevation > 0 ? "+" + std::to_string(elevation)
+                                                  : std::to_string(elevation);
+                Vec3 color = elevation >= 2 ? Vec3{0.08f, 0.09f, 0.11f}
+                                            : Vec3{0.96f, 0.97f, 1.0f};
+                AppendLabelText(vertices, label, worldX, worldY - kLabelPixelSize * 2.5, color);
+            });
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+                 vertices.data(), GL_DYNAMIC_DRAW);
+    outVertexCount = static_cast<GLsizei>(vertices.size() / 6);
+}
+
 // Rebuilds city-name and region-name labels for whatever is currently in view.
 void RebuildLabelMesh(GLuint vbo, GLsizei &outVertexCount) {
     std::vector<float> vertices;
@@ -3629,7 +4516,7 @@ void RebuildVisibleGridLines(GLuint vbo, GLsizei &outVertexCount) {
     const float r = 0.35f, g = 0.35f, b = 0.38f;
     std::vector<float> vertices;
 
-    if (gHexGrid) {
+    if (gEditorTab == EditorTab::World && gHexGrid) {
         // Dense hex outlines become visual noise and expensive below this screen size.
         if (kTileSize * gZoom >= 8.0) {
             for (int32_t row = minRow; row <= maxRow; ++row)
@@ -3675,7 +4562,7 @@ void RebuildRectPreview(GLuint vbo, GLsizei &outVertexCount) {
     const float g = gRectDragging ? 0.9f : 0.85f;
     const float b = gRectDragging ? 0.2f : 1.0f;
 
-    if (gHexGrid) {
+    if (gEditorTab == EditorTab::World && gHexGrid) {
         std::vector<float> vertices;
         for (int32_t col = minCol; col <= maxCol; ++col) {
             AppendTileOutline(vertices, col, minRow, r, g, b);
@@ -3728,7 +4615,14 @@ void RebuildToolPreview(GLuint vbo, GLsizei &outVertexCount) {
 
     auto [curWX, curWY] = CursorWorld();
 
-    if (gPlacementMode != PlacementMode::None) {
+    if (gEditorTab == EditorTab::Dungeon &&
+        gDungeonPlacementMode != DungeonPlacementMode::None) {
+        auto [col, row] = WorldToTile(curWX, curWY);
+        Vec3 markerColor = gDungeonPlacementMode == DungeonPlacementMode::Entrance
+                               ? Vec3{0.15f, 0.95f, 0.28f}
+                               : Vec3{0.12f, 0.65f, 1.0f};
+        AppendTileOutline(vertices, col, row, markerColor.r, markerColor.g, markerColor.b);
+    } else if (gPlacementMode != PlacementMode::None) {
         auto [col, row] = WorldToTile(curWX, curWY);
         AppendTileOutline(vertices, col, row, 1.0f, 0.55f, 0.15f);
     } else if (gToolMode == ToolMode::Measure && gMeasureStage != 0) {
@@ -3780,6 +4674,13 @@ void RebuildToolPreview(GLuint vbo, GLsizei &outVertexCount) {
                     gRoutePoints[i + 1].second);
         }
         addLine(gRoutePoints.back().first, gRoutePoints.back().second, curWX, curWY);
+    } else if (gToolMode == ToolMode::Brush || gToolMode == ToolMode::FloodFill ||
+               gToolMode == ToolMode::Scatter) {
+        auto [centerCol, centerRow] = WorldToTile(curWX, curWY);
+        for (int32_t dr = -gBrushRadius; dr <= gBrushRadius; ++dr)
+            for (int32_t dc = -gBrushRadius; dc <= gBrushRadius; ++dc)
+                if (BrushCovers(centerCol, dc, dr))
+                    AppendTileOutline(vertices, centerCol + dc, centerRow + dr, r, g, b);
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -3907,6 +4808,7 @@ int main() {
     LOG_INFO("  Ctrl+Z / Ctrl+Y   : undo / redo");
     LOG_INFO("  Keys 0-9          : select one of the first ten terrain brushes");
     LOG_INFO("  Terrain EDIT/NEW  : rename, recolor, or create project terrain types");
+    LOG_INFO("  Dungeon POI       : click its overworld marker to create or open its map");
     LOG_INFO("  WASD / Arrows     : pan the camera");
     LOG_INFO("  Mouse wheel       : zoom in/out (centered on cursor)");
     LOG_INFO("  R                 : reset camera/zoom");
@@ -3950,15 +4852,22 @@ int main() {
                                   gZoom != lastRenderZoom || gWindowWidth != lastRenderWidth ||
                                   gWindowHeight != lastRenderHeight || gSceneRevision != lastSceneRevision;
         if (staticSceneChanged) {
-            RebuildVisibleTileMesh(tileMesh.Buffer(), tileMesh.VertexCount());
-            RebuildVisibleRegionOverlay(regionMesh.Buffer(), regionMesh.VertexCount());
-            RebuildElevationContours(contourMesh.Buffer(), contourMesh.VertexCount());
-            RebuildVisibleFogOverlay(fogMesh.Buffer(), fogMesh.VertexCount());
-            RebuildVisibleGridLines(gridMesh.Buffer(), gridMesh.VertexCount());
-            RebuildCityMarkers(cityMesh.Buffer(), cityMesh.VertexCount());
-            RebuildPoiMarkers(poiMesh.Buffer(), poiMesh.VertexCount());
-            RebuildRouteMesh(routeMesh.Buffer(), routeMesh.VertexCount());
-            RebuildLabelMesh(labelMesh.Buffer(), labelMesh.VertexCount());
+            if (gEditorTab == EditorTab::Dungeon) {
+                RebuildDungeonTileMesh(tileMesh.Buffer(), tileMesh.VertexCount());
+                RebuildDungeonGrid(gridMesh.Buffer(), gridMesh.VertexCount());
+                RebuildDungeonFogOverlay(fogMesh.Buffer(), fogMesh.VertexCount());
+                RebuildDungeonElevationLabels(labelMesh.Buffer(), labelMesh.VertexCount());
+            } else {
+                RebuildVisibleTileMesh(tileMesh.Buffer(), tileMesh.VertexCount());
+                RebuildVisibleRegionOverlay(regionMesh.Buffer(), regionMesh.VertexCount());
+                RebuildElevationContours(contourMesh.Buffer(), contourMesh.VertexCount());
+                RebuildVisibleFogOverlay(fogMesh.Buffer(), fogMesh.VertexCount());
+                RebuildVisibleGridLines(gridMesh.Buffer(), gridMesh.VertexCount());
+                RebuildCityMarkers(cityMesh.Buffer(), cityMesh.VertexCount());
+                RebuildPoiMarkers(poiMesh.Buffer(), poiMesh.VertexCount());
+                RebuildRouteMesh(routeMesh.Buffer(), routeMesh.VertexCount());
+                RebuildLabelMesh(labelMesh.Buffer(), labelMesh.VertexCount());
+            }
             lastRenderCameraX = gCameraX;
             lastRenderCameraY = gCameraY;
             lastRenderZoom = gZoom;
@@ -3977,15 +4886,22 @@ int main() {
         glUniform2f(resolutionLoc, static_cast<float>(gWindowWidth), static_cast<float>(gWindowHeight));
 
         tileMesh.Draw(GL_TRIANGLES);
-        if (gShowRegions && !gElevationView) regionMesh.Draw(GL_TRIANGLES);
-        if (gShowGrid) gridMesh.Draw(GL_LINES);
-        contourMesh.Draw(GL_LINES);
-        routeMesh.Draw(GL_TRIANGLES);
-        cityMesh.Draw(GL_TRIANGLES);
-        poiMesh.Draw(GL_TRIANGLES);
-        if (gShowLabels) labelMesh.Draw(GL_TRIANGLES);
-        fogMesh.Draw(GL_TRIANGLES);
-        selectionMesh.Draw(GL_LINES);
+        if (gEditorTab == EditorTab::Dungeon) {
+            if (gShowGrid) gridMesh.Draw(GL_LINES);
+            if (gElevationView) labelMesh.Draw(GL_TRIANGLES);
+            fogMesh.Draw(GL_TRIANGLES);
+            selectionMesh.Draw(GL_LINES);
+        } else {
+            if (gShowRegions && !gElevationView) regionMesh.Draw(GL_TRIANGLES);
+            if (gShowGrid) gridMesh.Draw(GL_LINES);
+            contourMesh.Draw(GL_LINES);
+            routeMesh.Draw(GL_TRIANGLES);
+            cityMesh.Draw(GL_TRIANGLES);
+            poiMesh.Draw(GL_TRIANGLES);
+            if (gShowLabels) labelMesh.Draw(GL_TRIANGLES);
+            fogMesh.Draw(GL_TRIANGLES);
+            selectionMesh.Draw(GL_LINES);
+        }
         toolMesh.Draw(GL_LINES);
         guiMesh.Draw(GL_TRIANGLES);
 
