@@ -81,6 +81,24 @@ build\Release\MapDrawerCoreTests.exe
 It tests project-file persistence, compatibility, grid geometry, and core domain behaviour. It
 does not launch the graphical editor.
 
+The executable can also list or run individual feature suites:
+
+```powershell
+.\build\Release\MapDrawerCoreTests.exe
+.\build\Release\MapDrawerCoreTests.exe --list
+.\build\Release\MapDrawerCoreTests.exe --feature dungeons
+.\build\Release\MapDrawerCoreTests.exe --headless
+```
+
+Running it without arguments opens a live graphical dashboard and then executes every suite in
+sequence. Rows change from **WAIT** to **RUN**, then **PASS** or **FAIL**. A visual-check panel
+simultaneously displays the production tile, fog, marker, route, label, elevation, and UI-button
+geometry used by the presentation tests. Press Enter, Escape, or the window close button when
+finished. After the final result, the dashboard remains open indefinitely until one of those user
+actions closes it. The `--headless` option runs the same complete test without opening a window.
+CTest uses headless mode and registers each feature separately, so automated runs cannot wait for
+user input and failures identify the affected area.
+
 ## Rebuild after changing the source
 
 For normal source changes, only the build command is needed:
@@ -106,9 +124,15 @@ Run the initial `cmake -S . -B build -DBUILD_TESTING=ON` command again after cha
 
 ## Source layout
 
-- `src/main.cpp` coordinates input, editor operations, the GUI, and rendering.
+- `src/main.cpp` coordinates the window lifecycle, input, high-level tools, and frame assembly.
 - `src/app_config.h` contains application limits, tuning values, and file names.
 - `src/app_types.*` defines the domain model, palettes, and editor enums.
+- `src/editor_state.*` owns document-level editor state and lifecycle invalidation.
+- `src/editor_commands.*` provides world/dungeon layer reads, writes, and capacity management.
+- `src/editor_history.*` owns stroke recording and undo/redo independently of the window system.
 - `src/grid_geometry.*` contains square and hex grid calculations.
 - `src/project_document.*` reads, writes, and validates project files.
-- `tests/core_tests.cpp` tests non-graphical core behaviour.
+- `src/ui_geometry.*` generates UI primitives and hit targets without depending on OpenGL.
+- `src/render_geometry.*` generates camera-transformed map, route, marker, and label geometry.
+- `tests/core_tests.cpp` tests persistence, commands, history, geometry, and other non-graphical
+  behaviour.

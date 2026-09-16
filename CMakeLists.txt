@@ -22,13 +22,18 @@ FetchContent_MakeAvailable(glfw)
 add_executable(MapDrawer
     src/main.cpp
     src/app_types.cpp
+    src/editor_commands.cpp
+    src/editor_history.cpp
+    src/editor_state.cpp
     src/gl_lite.cpp
     src/grid_geometry.cpp
     src/logger.cpp
     src/mesh_buffer.cpp
     src/project_document.cpp
+    src/render_geometry.cpp
     src/shader_program.cpp
     src/tiny_font.cpp
+    src/ui_geometry.cpp
 )
 
 target_include_directories(MapDrawer PRIVATE src)
@@ -44,13 +49,32 @@ if (BUILD_TESTING)
     add_executable(MapDrawerCoreTests
         tests/core_tests.cpp
         src/app_types.cpp
+        src/editor_commands.cpp
+        src/editor_history.cpp
+        src/editor_state.cpp
+        src/gl_lite.cpp
         src/grid_geometry.cpp
+        src/logger.cpp
+        src/mesh_buffer.cpp
         src/project_document.cpp
+        src/render_geometry.cpp
+        src/shader_program.cpp
         src/tiny_font.cpp
+        src/ui_geometry.cpp
     )
     target_include_directories(MapDrawerCoreTests PRIVATE src)
+    target_link_libraries(MapDrawerCoreTests PRIVATE glfw opengl32)
     if (MSVC)
         target_compile_options(MapDrawerCoreTests PRIVATE /W4)
     endif()
-    add_test(NAME MapDrawerCoreTests COMMAND MapDrawerCoreTests)
+    add_test(NAME MapDrawerAllFeatures COMMAND MapDrawerCoreTests --headless)
+    set(MAP_DRAWER_TEST_FEATURES
+        grid terrain elevation fog regions markers routes dungeons tools commands
+        history state presentation persistence compatibility validation lookups
+    )
+    foreach(FEATURE IN LISTS MAP_DRAWER_TEST_FEATURES)
+        add_test(NAME MapDrawerFeature_${FEATURE}
+                 COMMAND MapDrawerCoreTests --feature ${FEATURE})
+        set_tests_properties(MapDrawerFeature_${FEATURE} PROPERTIES LABELS "feature")
+    endforeach()
 endif()

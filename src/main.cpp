@@ -4,12 +4,17 @@
 // scroll wheel, and save/load the world as one versioned project file.
 #include "app_config.h"
 #include "app_types.h"
+#include "editor_commands.h"
+#include "editor_history.h"
+#include "editor_state.h"
 #include "logger.h"
 #include "grid_geometry.h"
 #include "mesh_buffer.h"
 #include "project_document.h"
+#include "render_geometry.h"
 #include "shader_program.h"
 #include "tiny_font.h"
+#include "ui_geometry.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -87,7 +92,8 @@ void OpenKeybindHelp();
 
 // Persisted world data lives together; aliases keep the editing code concise while
 // making the ownership boundary explicit for save/load operations.
-ProjectDocument gProjectDocument;
+EditorState gEditor;
+auto &gProjectDocument = gEditor.document;
 auto &gTerrainDefinitions = gProjectDocument.terrainDefinitions;
 auto &gMapData = gProjectDocument.terrain;
 auto &gRegionData = gProjectDocument.regionsByTile;
@@ -157,7 +163,7 @@ std::string gInfoTitle;
 std::vector<std::string> gInfoLines;
 ConfirmAction gConfirmAction = ConfirmAction::None;
 std::string gProjectFile = kDefaultProjectFile;
-bool gProjectDirty = false;
+bool &gProjectDirty = gEditor.dirty;
 int gModalField = 0;
 int32_t gModalCol = 0, gModalRow = 0;
 PoiKind gModalPoiKind = PoiKind::Landmark;
@@ -165,7 +171,7 @@ RouteKind gModalRouteKind = RouteKind::River;
 int gEditingEncounterIndex = -1;
 double gLastCanvasWorldX = 0.0, gLastCanvasWorldY = 0.0;
 bool gUseUiTarget = false;
-uint64_t gSceneRevision = 1;
+uint64_t &gSceneRevision = gEditor.sceneRevision;
 
 // Line tool: press-drag-release paints a thick line between two points.
 bool gLineDragging = false;
@@ -186,12 +192,7 @@ double gCircleCenterWX = 0.0, gCircleCenterWY = 0.0;
 
 // Undo/redo: each stroke records the pre- and post-edit value of every tile it touched,
 // tagged with the tile layer it applies to.
-std::vector<StrokeRecord> gUndoStack;
-std::vector<StrokeRecord> gRedoStack;
-bool gStrokeActive = false;
-bool gStrokeChanged = false;
-PaintMode gStrokeLayer = PaintMode::Terrain;
-std::unordered_map<uint64_t, int16_t> gStrokeOriginal; // key -> value before this stroke touched it
+auto &gHistory = gEditor.history;
 
 // Shift+drag rectangle fill state.
 bool gRectDragging = false;
@@ -208,9 +209,9 @@ int32_t gClipboardWidth = 0, gClipboardHeight = 0;
 int gMeasureStage = 0; // 0 = none, 1 = following cursor, 2 = locked result
 int32_t gMeasureStartCol = 0, gMeasureStartRow = 0;
 int32_t gMeasureEndCol = 0, gMeasureEndRow = 0;
-std::string gLastSearchQuery;
-std::string gLastFoundLabel;
-std::vector<SearchResult> gSearchMatches;
+auto &gLastSearchQuery = gEditor.lastSearchQuery;
+auto &gLastFoundLabel = gEditor.lastFoundLabel;
+auto &gSearchMatches = gEditor.searchMatches;
 size_t gSearchMatchIndex = 0;
 
 void GlfwErrorCallback(int error, const char *description) {
@@ -429,8 +430,7 @@ void OpenDungeonTab(int index) {
     gPaintingRight = false;
     gMeasureStage = 0;
     gLastFoundLabel.clear();
-    gUndoStack.clear();
-    gRedoStack.clear();
+    gHistory.Clear();
     FitDungeonToWindow();
     ++gSceneRevision;
     UpdateWindowTitle();
@@ -440,8 +440,7 @@ void ReturnToWorldTab() {
     if (gEditorTab == EditorTab::World) return;
     gEditorTab = EditorTab::World;
     gDungeonPlacementMode = DungeonPlacementMode::None;
-    gUndoStack.clear();
-    gRedoStack.clear();
+    gHistory.Clear();
     gCameraX = gWorldCameraX;
     gCameraY = gWorldCameraY;
     gZoom = gWorldZoom;
@@ -450,34 +449,9 @@ void ReturnToWorldTab() {
 }
 
 int GetLayerValue(PaintMode layer, uint64_t key) {
-    if (gEditorTab == EditorTab::Dungeon) {
-        Dungeon *dungeon = ActiveDungeon();
-        if (!dungeon || layer == PaintMode::Region) return 0;
-        if (layer == PaintMode::Terrain) {
-            auto it = dungeon->tiles.find(key);
-            return it == dungeon->tiles.end() ? 0 : it->second;
-        }
-        if (layer == PaintMode::Elevation) {
-            auto it = dungeon->elevation.find(key);
-            return it == dungeon->elevation.end() ? 0 : it->second;
-        }
-        auto it = dungeon->fog.find(key);
-        return it == dungeon->fog.end() ? 0 : it->second;
-    }
-    if (layer == PaintMode::Terrain) {
-        auto it = gMapData.find(key);
-        return it == gMapData.end() ? 0 : it->second;
-    }
-    if (layer == PaintMode::Region) {
-        auto it = gRegionData.find(key);
-        return it == gRegionData.end() ? 0 : it->second;
-    }
-    if (layer == PaintMode::Elevation) {
-        auto it = gElevationData.find(key);
-        return it == gElevationData.end() ? 0 : it->second;
-    }
-    auto it = gFogData.find(key);
-    return it == gFogData.end() ? 0 : it->second;
+    Dungeon *dungeon = gEditorTab == EditorTab::Dungeon ? ActiveDungeon() : nullptr;
+    return editor_commands::GetLayerValue(
+        {gProjectDocument, dungeon, gEditorTab == EditorTab::Dungeon}, layer, key);
 }
 
 float ElevationHillshade(int32_t col, int32_t row) {
@@ -501,10 +475,7 @@ int GetCurrentLayerValue(int32_t col, int32_t row) {
 }
 
 void MarkProjectDirty() {
-    gProjectDirty = true;
-    gSearchMatches.clear();
-    gLastSearchQuery.clear();
-    gLastFoundLabel.clear();
+    gEditor.MarkDirty();
 }
 
 void PlaceDungeonSpecialAtCursor() {
@@ -530,34 +501,9 @@ void PlaceDungeonSpecialAtCursor() {
 }
 
 void SetLayerValue(PaintMode layer, uint64_t key, int value) {
-    if (gEditorTab == EditorTab::Dungeon) {
-        Dungeon *dungeon = ActiveDungeon();
-        if (!dungeon || layer == PaintMode::Region) return;
-        if (layer == PaintMode::Terrain) {
-            if (value == 0) dungeon->tiles.erase(key);
-            else dungeon->tiles[key] = static_cast<uint8_t>(value);
-        } else if (layer == PaintMode::Elevation) {
-            if (value == 0) dungeon->elevation.erase(key);
-            else dungeon->elevation[key] = static_cast<int8_t>(value);
-        } else {
-            if (value == 0) dungeon->fog.erase(key);
-            else dungeon->fog[key] = static_cast<uint8_t>(value);
-        }
-        return;
-    }
-    if (layer == PaintMode::Terrain) {
-        if (value == 0) gMapData.erase(key);
-        else gMapData[key] = static_cast<uint8_t>(value);
-    } else if (layer == PaintMode::Region) {
-        if (value == 0) gRegionData.erase(key);
-        else gRegionData[key] = static_cast<uint8_t>(value);
-    } else if (layer == PaintMode::Elevation) {
-        if (value == 0) gElevationData.erase(key);
-        else gElevationData[key] = static_cast<int8_t>(value);
-    } else {
-        if (value == 0) gFogData.erase(key);
-        else gFogData[key] = static_cast<uint8_t>(value);
-    }
+    Dungeon *dungeon = gEditorTab == EditorTab::Dungeon ? ActiveDungeon() : nullptr;
+    editor_commands::SetLayerValue(
+        {gProjectDocument, dungeon, gEditorTab == EditorTab::Dungeon}, layer, key, value);
 }
 
 // Returns the value the active tool should paint with, or -1 if painting isn't possible
@@ -586,27 +532,15 @@ size_t EstimatedTileCount(int32_t minCol, int32_t minRow, int32_t maxCol, int32_
 }
 
 void BeginStroke(size_t expectedTiles = 0, int paintValue = kNoPaintValue) {
-    gStrokeActive = true;
-    gStrokeChanged = false;
-    gStrokeLayer = gPaintMode;
-    gStrokeOriginal.clear();
+    gHistory.BeginStroke(gPaintMode, expectedTiles);
     gFlattenHeightCaptured = false;
     expectedTiles = std::min(expectedTiles, kBulkReserveLimit);
     if (expectedTiles > 0) {
-        gStrokeOriginal.reserve(expectedTiles);
         if (paintValue != 0) {
             Dungeon *dungeon = ActiveDungeon();
-            if (gEditorTab == EditorTab::Dungeon && dungeon) {
-                if (gStrokeLayer == PaintMode::Terrain)
-                    dungeon->tiles.reserve(dungeon->tiles.size() + expectedTiles);
-                else if (gStrokeLayer == PaintMode::Elevation)
-                    dungeon->elevation.reserve(dungeon->elevation.size() + expectedTiles);
-                else if (gStrokeLayer == PaintMode::Fog)
-                    dungeon->fog.reserve(dungeon->fog.size() + expectedTiles);
-            } else if (gStrokeLayer == PaintMode::Terrain) gMapData.reserve(gMapData.size() + expectedTiles);
-            else if (gStrokeLayer == PaintMode::Region) gRegionData.reserve(gRegionData.size() + expectedTiles);
-            else if (gStrokeLayer == PaintMode::Elevation) gElevationData.reserve(gElevationData.size() + expectedTiles);
-            else gFogData.reserve(gFogData.size() + expectedTiles);
+            editor_commands::ReserveLayer(
+                {gProjectDocument, dungeon, gEditorTab == EditorTab::Dungeon},
+                gHistory.StrokeLayer(), expectedTiles);
         }
     }
 }
@@ -614,9 +548,9 @@ void BeginStroke(size_t expectedTiles = 0, int paintValue = kNoPaintValue) {
 // Sets (or, for value 0, erases) a tile in the active layer, recording its pre-stroke value.
 void SetTileRecorded(int32_t col, int32_t row, int value) {
     uint64_t key = TileKey(col, row);
-    PaintMode layer = gStrokeActive ? gStrokeLayer : gPaintMode;
+    PaintMode layer = gHistory.StrokeActive() ? gHistory.StrokeLayer() : gPaintMode;
     if (layer == PaintMode::Elevation && value != 0 && gElevationEditMode != ElevationEditMode::Set) {
-        if (gStrokeActive && gStrokeOriginal.count(key) != 0) return;
+        if (gHistory.StrokeActive() && gHistory.HasRecorded(key)) return;
         int oldValue = GetLayerValue(PaintMode::Elevation, key);
         if (gElevationEditMode == ElevationEditMode::Raise) {
             value = std::min(kMaxElevation, oldValue + 1);
@@ -640,88 +574,39 @@ void SetTileRecorded(int32_t col, int32_t row, int value) {
                                kMinElevation, kMaxElevation);
         }
     }
-    auto update = [&](auto &tileLayer) {
-        using StoredValue = typename std::decay_t<decltype(tileLayer)>::mapped_type;
-        auto it = tileLayer.find(key);
-        int oldValue = it == tileLayer.end() ? 0 : static_cast<int>(it->second);
-        if (oldValue == value) return false;
-        if (gStrokeActive) gStrokeOriginal.emplace(key, static_cast<int16_t>(oldValue));
-        if (value == 0) {
-            if (it != tileLayer.end()) tileLayer.erase(it);
-        } else if (it == tileLayer.end()) {
-            tileLayer.emplace(key, static_cast<StoredValue>(value));
-        } else {
-            it->second = static_cast<StoredValue>(value);
-        }
-        return true;
-    };
-    bool changed = false;
     Dungeon *dungeon = ActiveDungeon();
-    if (gEditorTab == EditorTab::Dungeon && dungeon) {
-        changed = layer == PaintMode::Terrain ? update(dungeon->tiles)
-                  : layer == PaintMode::Elevation ? update(dungeon->elevation)
-                  : layer == PaintMode::Fog ? update(dungeon->fog)
-                                            : false;
-    } else {
-        changed = layer == PaintMode::Terrain ? update(gMapData)
-                  : layer == PaintMode::Region ? update(gRegionData)
-                  : layer == PaintMode::Elevation ? update(gElevationData)
-                                                  : update(gFogData);
-    }
+    EditTarget target{gProjectDocument, dungeon, gEditorTab == EditorTab::Dungeon};
+    int oldValue = editor_commands::GetLayerValue(target, layer, key);
+    bool changed = editor_commands::SetLayerValue(target, layer, key, value);
     if (changed) {
+        if (gHistory.StrokeActive()) gHistory.RecordOriginal(key, oldValue);
         MarkProjectDirty();
-        if (gStrokeActive) gStrokeChanged = true;
-        else ++gSceneRevision;
+        if (!gHistory.StrokeActive()) ++gSceneRevision;
     }
 }
 
 void EndStroke() {
-    if (!gStrokeActive) return;
-    gStrokeActive = false;
-    if (!gStrokeChanged || gStrokeOriginal.empty()) return;
-
-    StrokeRecord record;
-    record.layer = gStrokeLayer;
-    record.changes.reserve(gStrokeOriginal.size());
-    for (const auto &entry : gStrokeOriginal) {
-        int newValue = GetLayerValue(gStrokeLayer, entry.first);
-        record.changes.push_back({entry.first, entry.second, static_cast<int16_t>(newValue)});
-    }
-    gStrokeOriginal.clear();
+    if (!gHistory.EndStroke(GetLayerValue)) return;
     ++gSceneRevision;
     MarkProjectDirty();
-
-    gUndoStack.push_back(std::move(record));
-    if (gUndoStack.size() > kMaxUndoStrokes) gUndoStack.erase(gUndoStack.begin());
-    gRedoStack.clear();
 }
 
 void Undo() {
-    if (gUndoStack.empty()) return;
-    StrokeRecord record = std::move(gUndoStack.back());
-    gUndoStack.pop_back();
-    for (const auto &change : record.changes) {
-        SetLayerValue(record.layer, change.key, change.oldValue);
-    }
+    auto result = gHistory.Undo(SetLayerValue);
+    if (!result) return;
     ++gSceneRevision;
     MarkProjectDirty();
-    LOG_INFO("Undo (%zu tiles, %s layer)", record.changes.size(),
-              PaintModeName(record.layer));
-    gRedoStack.push_back(std::move(record));
+    LOG_INFO("Undo (%zu tiles, %s layer)", result->tileCount,
+             PaintModeName(result->layer));
 }
 
 void Redo() {
-    if (gRedoStack.empty()) return;
-    StrokeRecord record = std::move(gRedoStack.back());
-    gRedoStack.pop_back();
-    for (const auto &change : record.changes) {
-        SetLayerValue(record.layer, change.key, change.newValue);
-    }
+    auto result = gHistory.Redo(SetLayerValue);
+    if (!result) return;
     ++gSceneRevision;
     MarkProjectDirty();
-    LOG_INFO("Redo (%zu tiles, %s layer)", record.changes.size(),
-              PaintModeName(record.layer));
-    gUndoStack.push_back(std::move(record));
+    LOG_INFO("Redo (%zu tiles, %s layer)", result->tileCount,
+             PaintModeName(result->layer));
 }
 
 // Flood-fills the contiguous region of matching value (in the active layer) starting at (col, row).
@@ -1800,7 +1685,7 @@ void UpdateWindowTitle() {
                   gProjectDirty ? " *" : "", ToolName(gToolMode), gRoundBrush ? " (round)" : "", modeLabel, paintInfo,
                   gBrushRadius * 2 + 1, regionInfo, gShowGrid ? "on" : "off",
                   gHexGrid ? "(hex)" : "(square)", gZoom * 100.0,
-                  gUndoStack.size(), gRedoStack.size(), col, row);
+                  gHistory.UndoCount(), gHistory.RedoCount(), col, row);
     glfwSetWindowTitle(gWindow, title);
 }
 
@@ -2143,9 +2028,7 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
         LoadCities();
         LoadPois();
         LoadRoutes();
-        ++gSceneRevision;
-        gUndoStack.clear();
-        gRedoStack.clear();
+        gEditor.ResetForLoadedDocument();
         gSelectionActive = false;
         gPlacementMode = PlacementMode::None;
         if (gEditorTab == EditorTab::Dungeon) {
@@ -2161,10 +2044,6 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
         gTileClipboard.clear();
         gPlayerView = false;
         gMeasureStage = 0;
-        gSearchMatches.clear();
-        gLastSearchQuery.clear();
-        gLastFoundLabel.clear();
-        gProjectDirty = false;
         UpdateWindowTitle();
         return true;
     }
@@ -2187,8 +2066,7 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
         gNextRegionId = std::max(gNextRegionId, regionId + 1);
     }
     gActiveRegionId = 0;
-    gUndoStack.clear();
-    gRedoStack.clear();
+    gEditor.ResetForLoadedDocument();
     gSelectionActive = false;
     gPlacementMode = PlacementMode::None;
     if (gEditorTab == EditorTab::Dungeon) {
@@ -2204,11 +2082,6 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
     gTileClipboard.clear();
     gPlayerView = false;
     gMeasureStage = 0;
-    gSearchMatches.clear();
-    gLastSearchQuery.clear();
-    gLastFoundLabel.clear();
-    ++gSceneRevision;
-    gProjectDirty = false;
     LOG_INFO("Project loaded from %s (version %d, %zu terrain tiles, %zu elevation tiles)",
              path.c_str(), version, gMapData.size(), gElevationData.size());
     UpdateWindowTitle();
@@ -2242,8 +2115,7 @@ void ClearActiveLayerNow() {
         removed = gFogData.size();
         gFogData.clear();
     }
-    gUndoStack.clear();
-    gRedoStack.clear();
+    gHistory.Clear();
     ++gSceneRevision;
     MarkProjectDirty();
     LOG_INFO("Cleared %zu tiles from the %s layer", removed, PaintModeName(gPaintMode));
@@ -2489,38 +2361,17 @@ void AdjustSelectionElevation(int delta) {
 
 void AppendUiRect(std::vector<float> &vertices, float x, float y, float w, float h,
                   const Vec3 &color, float alpha = 1.0f) {
-    const float quad[] = {
-        x, y, color.r, color.g, color.b, alpha, x + w, y, color.r, color.g, color.b, alpha,
-        x + w, y + h, color.r, color.g, color.b, alpha,
-        x, y, color.r, color.g, color.b, alpha, x + w, y + h, color.r, color.g, color.b, alpha,
-        x, y + h, color.r, color.g, color.b, alpha,
-    };
-    vertices.insert(vertices.end(), std::begin(quad), std::end(quad));
+    ui_geometry::AppendRect(vertices, x, y, w, h, color, alpha);
 }
 
 void AppendUiText(std::vector<float> &vertices, std::string text, float x, float y, float scale,
                   const Vec3 &color, size_t maxChars = 64) {
-    if (text.size() > maxChars) text = text.substr(0, maxChars);
-    for (char c : text) {
-        Glyph3x5 glyph = GetGlyph(c);
-        for (int row = 0; row < 5; ++row) {
-            for (int col = 0; col < 3; ++col) {
-                if ((glyph.rows[row] & (1u << (2 - col))) == 0) continue;
-                AppendUiRect(vertices, x + col * scale, y + row * scale, scale, scale, color);
-            }
-        }
-        x += scale * 4.0f;
-    }
+    ui_geometry::AppendText(vertices, std::move(text), x, y, scale, color, maxChars);
 }
 
 void AddUiButton(std::vector<float> &vertices, float x, float y, float w, float h,
                  const std::string &label, UiAction action, int value = 0, bool selected = false) {
-    Vec3 fill = selected ? Vec3{0.30f, 0.48f, 0.68f} : Vec3{0.18f, 0.20f, 0.24f};
-    AppendUiRect(vertices, x, y, w, h, fill);
-    AppendUiRect(vertices, x, y + h - 1.0f, w, 1.0f, {0.38f, 0.41f, 0.47f});
-    AppendUiText(vertices, label, x + 6.0f, y + 7.0f, 1.5f, {0.92f, 0.93f, 0.95f},
-                 static_cast<size_t>(std::max(1.0f, (w - 10.0f) / 6.0f)));
-    gUiHits.push_back({x, y, w, h, action, value});
+    ui_geometry::AppendButton(vertices, gUiHits, x, y, w, h, label, action, value, selected);
 }
 
 void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
@@ -3405,7 +3256,7 @@ void MouseButtonCallback(GLFWwindow * /*window*/, int button, int action, int mo
                 BeginStroke();
                 auto [wx, wy] = CursorWorld();
                 ScatterAt(wx, wy, ActivePaintValue());
-                if (gStrokeChanged) ++gSceneRevision;
+                if (gHistory.StrokeChanged()) ++gSceneRevision;
             } else if (mods & GLFW_MOD_SHIFT) {
                 gRectDragging = true;
                 gRectErase = false;
@@ -3416,7 +3267,7 @@ void MouseButtonCallback(GLFWwindow * /*window*/, int button, int action, int mo
                 gPaintingLeft = true;
                 BeginStroke();
                 PaintAtCursor(ActivePaintValue());
-                if (gStrokeChanged) ++gSceneRevision;
+                if (gHistory.StrokeChanged()) ++gSceneRevision;
             }
         } else if (action == GLFW_RELEASE) {
             if (gToolMode == ToolMode::Selection && gSelectionDragging) {
@@ -3481,7 +3332,7 @@ void MouseButtonCallback(GLFWwindow * /*window*/, int button, int action, int mo
                 BeginStroke();
                 auto [wx, wy] = CursorWorld();
                 ScatterAt(wx, wy, 0);
-                if (gStrokeChanged) ++gSceneRevision;
+                if (gHistory.StrokeChanged()) ++gSceneRevision;
             } else if (mods & GLFW_MOD_SHIFT) {
                 gRectDragging = true;
                 gRectErase = true;
@@ -3492,7 +3343,7 @@ void MouseButtonCallback(GLFWwindow * /*window*/, int button, int action, int mo
                 gPaintingRight = true;
                 BeginStroke();
                 PaintAtCursor(0);
-                if (gStrokeChanged) ++gSceneRevision;
+                if (gHistory.StrokeChanged()) ++gSceneRevision;
             }
         } else if (action == GLFW_RELEASE) {
             if (gRectDragging && gRectErase) {
@@ -3536,12 +3387,12 @@ void CursorPosCallback(GLFWwindow * /*window*/, double x, double y) {
     if (gToolMode == ToolMode::Scatter) {
         if (gPaintingLeft) { auto [wx, wy] = CursorWorld(); ScatterAt(wx, wy, ActivePaintValue()); }
         else if (gPaintingRight) { auto [wx, wy] = CursorWorld(); ScatterAt(wx, wy, 0); }
-        if (gStrokeChanged) ++gSceneRevision;
+        if (gHistory.StrokeChanged()) ++gSceneRevision;
         return;
     }
     if (gPaintingLeft) PaintAtCursor(ActivePaintValue());
     else if (gPaintingRight) PaintAtCursor(0);
-    if ((gPaintingLeft || gPaintingRight) && gStrokeChanged) ++gSceneRevision;
+    if ((gPaintingLeft || gPaintingRight) && gHistory.StrokeChanged()) ++gSceneRevision;
 }
 
 // Zooms in/out, keeping the world point under the cursor stationary on screen.
@@ -3831,78 +3682,17 @@ void UpdateCameraPan(double deltaSeconds) {
 void AppendTileTriangles(std::vector<float> &vertices, int32_t col, int32_t row,
                          const Vec3 &color, float alpha) {
     auto [worldCx, worldCy] = TileCenterWorld(col, row);
-    float cx = static_cast<float>((worldCx - gCameraX) * gZoom);
-    float cy = static_cast<float>((worldCy - gCameraY) * gZoom);
-    if (kTileSize * gZoom < 3.0) {
-        float half = std::max(0.6f, static_cast<float>(kTileSize * gZoom * 0.5));
-        const float quad[] = {
-            cx - half, cy - half, color.r, color.g, color.b, alpha,
-            cx + half, cy - half, color.r, color.g, color.b, alpha,
-            cx + half, cy + half, color.r, color.g, color.b, alpha,
-            cx - half, cy - half, color.r, color.g, color.b, alpha,
-            cx + half, cy + half, color.r, color.g, color.b, alpha,
-            cx - half, cy + half, color.r, color.g, color.b, alpha,
-        };
-        vertices.insert(vertices.end(), std::begin(quad), std::end(quad));
-        return;
-    }
-    bool hexGrid = gEditorTab == EditorTab::World && gHexGrid;
-    int cornerCount = hexGrid ? 6 : 4;
-    std::array<std::pair<float, float>, 6> corners{};
-    if (hexGrid) {
-        float radius = static_cast<float>(kTileSize * 0.5 * gZoom);
-        for (int i = 0; i < cornerCount; ++i) {
-            double angle = i * kPi / 3.0;
-            corners[static_cast<size_t>(i)] =
-                {cx + radius * static_cast<float>(std::cos(angle)),
-                 cy + radius * static_cast<float>(std::sin(angle))};
-        }
-    } else {
-        float half = static_cast<float>(kTileSize * 0.5 * gZoom);
-        corners[0] = {cx - half, cy - half};
-        corners[1] = {cx + half, cy - half};
-        corners[2] = {cx + half, cy + half};
-        corners[3] = {cx - half, cy + half};
-    }
-    for (int i = 0; i < cornerCount; ++i) {
-        const auto &a = corners[static_cast<size_t>(i)];
-        const auto &b = corners[static_cast<size_t>((i + 1) % cornerCount)];
-        vertices.insert(vertices.end(),
-                        {cx, cy, color.r, color.g, color.b, alpha,
-                         a.first, a.second, color.r, color.g, color.b, alpha,
-                         b.first, b.second, color.r, color.g, color.b, alpha});
-    }
+    render_geometry::AppendTile(vertices, worldCx, worldCy,
+                                {gCameraX, gCameraY, gZoom},
+                                gEditorTab == EditorTab::World && gHexGrid, color, alpha);
 }
 
 void AppendTileOutline(std::vector<float> &vertices, int32_t col, int32_t row,
                        float r, float g, float b) {
     auto [worldCx, worldCy] = TileCenterWorld(col, row);
-    float cx = static_cast<float>((worldCx - gCameraX) * gZoom);
-    float cy = static_cast<float>((worldCy - gCameraY) * gZoom);
-    bool hexGrid = gEditorTab == EditorTab::World && gHexGrid;
-    int cornerCount = hexGrid ? 6 : 4;
-    std::array<std::pair<float, float>, 6> corners{};
-    if (hexGrid) {
-        float radius = static_cast<float>(kTileSize * 0.5 * gZoom);
-        for (int i = 0; i < cornerCount; ++i) {
-            double angle = i * kPi / 3.0;
-            corners[static_cast<size_t>(i)] =
-                {cx + radius * static_cast<float>(std::cos(angle)),
-                 cy + radius * static_cast<float>(std::sin(angle))};
-        }
-    } else {
-        float half = static_cast<float>(kTileSize * 0.5 * gZoom);
-        corners[0] = {cx - half, cy - half};
-        corners[1] = {cx + half, cy - half};
-        corners[2] = {cx + half, cy + half};
-        corners[3] = {cx - half, cy + half};
-    }
-    for (int i = 0; i < cornerCount; ++i) {
-        const auto &a = corners[static_cast<size_t>(i)];
-        const auto &next = corners[static_cast<size_t>((i + 1) % cornerCount)];
-        vertices.insert(vertices.end(), {a.first, a.second, r, g, b, 1.0f,
-                                         next.first, next.second, r, g, b, 1.0f});
-    }
+    render_geometry::AppendTileOutline(vertices, worldCx, worldCy,
+                                       {gCameraX, gCameraY, gZoom},
+                                       gEditorTab == EditorTab::World && gHexGrid, {r, g, b});
 }
 
 template <typename Layer, typename Callback>
@@ -4212,18 +4002,7 @@ void RebuildCityMarkers(GLuint vbo, GLsizei &outVertexCount) {
 // Appends a filled regular polygon (triangle fan) centered at (cx, cy) in screen space.
 void AppendRegularPolygon(std::vector<float> &vertices, float cx, float cy, float radius, int sides,
                           float rotation, float r, float g, float b) {
-    for (int i = 0; i < sides; ++i) {
-        float a0 = rotation + static_cast<float>(2.0 * kPi * i / sides);
-        float a1 = rotation + static_cast<float>(2.0 * kPi * (i + 1) / sides);
-        // clang-format off
-        const float tri[] = {
-            cx, cy, r, g, b, 1.0f,
-            cx + radius * std::cos(a0), cy + radius * std::sin(a0), r, g, b, 1.0f,
-            cx + radius * std::cos(a1), cy + radius * std::sin(a1), r, g, b, 1.0f,
-        };
-        // clang-format on
-        vertices.insert(vertices.end(), std::begin(tri), std::end(tri));
-    }
+    render_geometry::AppendRegularPolygon(vertices, cx, cy, radius, sides, rotation, {r, g, b});
 }
 
 // Rebuilds POI and DM-only encounter markers currently in view.
@@ -4274,33 +4053,8 @@ void RebuildPoiMarkers(GLuint vbo, GLsizei &outVertexCount) {
 // Appends a thick line segment (a screen-space quad) between two world-space points.
 void AppendThickLineWorld(std::vector<float> &vertices, double x0, double y0, double x1, double y1,
                           float thicknessWorld, Vec3 color) {
-    double dx = x1 - x0, dy = y1 - y0;
-    double len = std::hypot(dx, dy);
-    if (len < 1e-6) return;
-    double nx = -dy / len * thicknessWorld * 0.5;
-    double ny = dx / len * thicknessWorld * 0.5;
-
-    auto toScreen = [&](double wx, double wy) {
-        return std::pair<float, float>(static_cast<float>((wx - gCameraX) * gZoom),
-                                       static_cast<float>((wy - gCameraY) * gZoom));
-    };
-    auto [ax, ay] = toScreen(x0 + nx, y0 + ny);
-    auto [bx, by] = toScreen(x1 + nx, y1 + ny);
-    auto [cx, cy] = toScreen(x1 - nx, y1 - ny);
-    auto [dxs, dys] = toScreen(x0 - nx, y0 - ny);
-
-    // clang-format off
-    const float quad[] = {
-        ax, ay, color.r, color.g, color.b, 1.0f,
-        bx, by, color.r, color.g, color.b, 1.0f,
-        cx, cy, color.r, color.g, color.b, 1.0f,
-
-        ax, ay, color.r, color.g, color.b, 1.0f,
-        cx, cy, color.r, color.g, color.b, 1.0f,
-        dxs, dys, color.r, color.g, color.b, 1.0f,
-    };
-    // clang-format on
-    vertices.insert(vertices.end(), std::begin(quad), std::end(quad));
+    render_geometry::AppendThickWorldLine(vertices, x0, y0, x1, y1, thicknessWorld, color,
+                                          {gCameraX, gCameraY, gZoom});
 }
 
 // Rebuilds ribbon meshes for all rivers/trade routes (drawn as thick lines, not painted tiles).
@@ -4348,38 +4102,9 @@ void RebuildRouteMesh(GLuint vbo, GLsizei &outVertexCount) {
 // using the tiny 3x5 pixel font.
 void AppendLabelText(std::vector<float> &vertices, const std::string &text, double worldCenterX,
                      double worldTopY, Vec3 color) {
-    if (text.empty()) return;
-    float width = static_cast<float>(text.size()) * kLabelGlyphAdvance - kLabelPixelSize;
-    double startX = worldCenterX - width * 0.5;
-
-    for (char ch : text) {
-        Glyph3x5 glyph = GetGlyph(ch);
-        for (int row = 0; row < 5; ++row) {
-            for (int col = 0; col < 3; ++col) {
-                if (!((glyph.rows[row] >> (2 - col)) & 1)) continue;
-                double wx0 = startX + col * kLabelPixelSize;
-                double wy0 = worldTopY + row * kLabelPixelSize;
-                float x0 = static_cast<float>((wx0 - gCameraX) * gZoom);
-                float y0 = static_cast<float>((wy0 - gCameraY) * gZoom);
-                float x1 = static_cast<float>((wx0 + kLabelPixelSize - gCameraX) * gZoom);
-                float y1 = static_cast<float>((wy0 + kLabelPixelSize - gCameraY) * gZoom);
-
-                // clang-format off
-                const float quad[] = {
-                    x0, y0, color.r, color.g, color.b, 1.0f,
-                    x1, y0, color.r, color.g, color.b, 1.0f,
-                    x1, y1, color.r, color.g, color.b, 1.0f,
-
-                    x0, y0, color.r, color.g, color.b, 1.0f,
-                    x1, y1, color.r, color.g, color.b, 1.0f,
-                    x0, y1, color.r, color.g, color.b, 1.0f,
-                };
-                // clang-format on
-                vertices.insert(vertices.end(), std::begin(quad), std::end(quad));
-            }
-        }
-        startX += kLabelGlyphAdvance;
-    }
+    render_geometry::AppendWorldText(vertices, text, worldCenterX, worldTopY, color,
+                                     kLabelPixelSize, kLabelGlyphAdvance,
+                                     {gCameraX, gCameraY, gZoom});
 }
 
 void RebuildDungeonElevationLabels(GLuint vbo, GLsizei &outVertexCount) {
