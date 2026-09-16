@@ -37,7 +37,7 @@ add_executable(MapDrawer
 )
 
 target_include_directories(MapDrawer PRIVATE src)
-target_link_libraries(MapDrawer PRIVATE glfw opengl32)
+target_link_libraries(MapDrawer PRIVATE glfw opengl32 comdlg32)
 
 if (MSVC)
     target_compile_options(MapDrawer PRIVATE /W4)

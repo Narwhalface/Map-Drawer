@@ -375,6 +375,7 @@ void TestProjectRoundTrip() {
     dungeon.worldRow = 5;
     dungeon.name = "Old Gate Crypt";
     dungeon.description = "Three rooms beneath the ruined arch";
+    dungeon.sourceFile = "linked_crypt.txt";
     dungeon.terrainDefinitions.push_back({"Moss", {0.18f, 0.42f, 0.16f}});
     dungeon.tiles[grid_geometry::Pack(0, 0)] = static_cast<uint8_t>(DungeonTileKind::Floor);
     dungeon.tiles[grid_geometry::Pack(1, 0)] = 6;
@@ -432,15 +433,36 @@ void TestProjectRoundTrip() {
               loaded.dungeons[0].hasExit && loaded.dungeons[0].exitCol == 5 &&
               loaded.dungeons[0].exitRow == 2 && loaded.dungeons[0].terrainDefinitions.size() == 7 &&
               loaded.dungeons[0].terrainDefinitions[6].name == "Moss" &&
-              loaded.dungeons[0].elevation.size() == 1 && loaded.dungeons[0].fog.size() == 1,
-          "dungeon terrain, elevation, fog, and special markers round-trip");
+              loaded.dungeons[0].elevation.size() == 1 && loaded.dungeons[0].fog.size() == 1 &&
+              loaded.dungeons[0].sourceFile == "linked_crypt.txt",
+          "dungeon terrain, elevation, fog, file link, and special markers round-trip");
     Check(loaded.routes.size() == 1 && loaded.routes[0].kind == RouteKind::River &&
               loaded.routes[0].name == "Bluewater" && loaded.routes[0].points.size() == 2 &&
               loaded.routes[0].points[0].first == 1.25 && loaded.routes[0].points[1].second == 4.0,
           "route geometry round-trips");
 
+    ProjectDocument standaloneSource;
+    standaloneSource.standaloneDungeon = true;
+    Dungeon standaloneDungeon;
+    standaloneDungeon.name = "Standalone Crypt";
+    standaloneDungeon.tiles[grid_geometry::Pack(2, 3)] =
+        static_cast<uint8_t>(DungeonTileKind::Floor);
+    standaloneSource.dungeons.push_back(std::move(standaloneDungeon));
+    const std::filesystem::path standalonePath =
+        std::filesystem::temp_directory_path() / "map_drawer_standalone_dungeon.txt";
+    error.clear();
+    Check(SaveProjectDocument(standalonePath.string(), standaloneSource, error),
+          "standalone dungeon document saves");
+    ProjectDocument standaloneLoaded;
+    Check(LoadProjectDocument(standalonePath.string(), standaloneLoaded, version, error) &&
+              standaloneLoaded.standaloneDungeon && standaloneLoaded.dungeons.size() == 1 &&
+              standaloneLoaded.pointsOfInterest.empty() &&
+              standaloneLoaded.dungeons[0].name == "Standalone Crypt",
+          "standalone dungeon identity and map round-trip without an overworld POI");
+
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
+    std::filesystem::remove(standalonePath, ignored);
 }
 
 void TestVersionThreeProjectCompatibility() {
@@ -493,6 +515,7 @@ void TestDungeonPoiMigration() {
         std::string line;
         bool skippingDungeonLayers = false;
         while (std::getline(input, line)) {
+            if (line.rfind("DOCUMENT ", 0) == 0) continue;
             if (line.rfind("DUNGEON_TERRAINS ", 0) == 0) {
                 skippingDungeonLayers = true;
                 continue;
@@ -503,6 +526,14 @@ void TestDungeonPoiMigration() {
         }
         input.close();
         lines[0] = "MAP_DRAWER_PROJECT 6";
+        for (size_t index = 0; index + 1 < lines.size(); ++index) {
+            if (lines[index].rfind("DUNGEONS ", 0) == 0 &&
+                lines[index + 1].size() >= 3 &&
+                lines[index + 1].compare(lines[index + 1].size() - 3, 3, " \"\"") == 0) {
+                lines[index + 1].resize(lines[index + 1].size() - 3);
+                break;
+            }
+        }
         std::ofstream output(path, std::ios::trunc);
         for (const std::string &savedLine : lines) output << savedLine << '\n';
     }

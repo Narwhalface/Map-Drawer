@@ -61,6 +61,7 @@ struct Dungeon {
     int32_t worldRow = 0;
     std::string name;
     std::string description;
+    std::string sourceFile;
     std::vector<TerrainDefinition> terrainDefinitions = DefaultDungeonTerrainDefinitions();
     std::unordered_map<uint64_t, uint8_t> tiles;
     std::unordered_map<uint64_t, int8_t> elevation;
@@ -100,7 +101,8 @@ enum class DungeonPlacementMode { None, Entrance, Exit };
 enum class ConfirmAction { None, ClearLayer, LoadProject, OverwriteProject, RecoverAutosave, GenerateRelief };
 
 enum class UiAction {
-    None, SetMode, SetTool, SetTerrain, EditTerrains, TerrainPagePrevious, TerrainPageNext,
+    None, MainWorld, MainDungeon, MainLoad, MainQuit,
+    SetMode, SetTool, SetTerrain, EditTerrains, TerrainPagePrevious, TerrainPageNext,
     SetElevationValue, SetElevationTool,
     ElevationDown, ElevationUp, BrushDown, BrushUp, ToggleShape,
     NewRegion, CycleRegion, NewCity, NewPoi, NewEncounter, OpenDungeons, DeleteMarker, DeleteRoute,
@@ -113,7 +115,7 @@ enum class UiAction {
     ModalPrevious, ModalNext, ModalAccept, ModalCancel, ModalPoiKind,
     ModalTerrainPrevious, ModalTerrainNext, ModalTerrainNew,
     DungeonReturnWorld, DungeonSetTile, DungeonPlaceEntrance, DungeonPlaceExit,
-    DungeonFit, DungeonEditDetails, DungeonManagerOpen, DungeonManagerNew
+    DungeonFit, DungeonEditDetails, DungeonManagerOpen, DungeonManagerNew, DungeonManagerLink
 };
 
 struct TileChange {

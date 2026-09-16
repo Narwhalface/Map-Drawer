@@ -17,7 +17,11 @@
 #include "ui_geometry.h"
 
 #define GLFW_INCLUDE_NONE
+#define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
+
+#include <commdlg.h>
 
 #include <algorithm>
 #include <array>
@@ -81,7 +85,7 @@ void SelectTool(ToolMode mode);
 void SaveProjectNow();
 void RequestProjectSave();
 bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback);
-void RequestProjectLoad();
+bool RequestProjectLoad();
 void RequestClearActiveLayer();
 void ClearActiveLayerNow();
 void SaveProjectConfig();
@@ -89,6 +93,9 @@ void LoadProjectConfig();
 void CheckForRecoveryAutosave();
 void GenerateTerrainRelief();
 void OpenKeybindHelp();
+void MarkProjectDirty();
+std::string ChooseProjectFileToOpen(const char *title);
+std::string ChooseProjectFileToSave(const char *title, const std::string &suggestedName);
 
 // Persisted world data lives together; aliases keep the editing code concise while
 // making the ownership boundary explicit for save/load operations.
@@ -163,6 +170,7 @@ std::string gInfoTitle;
 std::vector<std::string> gInfoLines;
 ConfirmAction gConfirmAction = ConfirmAction::None;
 std::string gProjectFile = kDefaultProjectFile;
+std::string gPendingLoadFile;
 bool &gProjectDirty = gEditor.dirty;
 int gModalField = 0;
 int32_t gModalCol = 0, gModalRow = 0;
@@ -172,6 +180,8 @@ int gEditingEncounterIndex = -1;
 double gLastCanvasWorldX = 0.0, gLastCanvasWorldY = 0.0;
 bool gUseUiTarget = false;
 uint64_t &gSceneRevision = gEditor.sceneRevision;
+bool gMainMenuOpen = true;
+bool gEditorSessionStarted = false;
 
 // Line tool: press-drag-release paints a thick line between two points.
 bool gLineDragging = false;
@@ -225,6 +235,46 @@ void FramebufferSizeCallback(GLFWwindow * /*window*/, int width, int height) {
 void WindowSizeCallback(GLFWwindow * /*window*/, int width, int height) {
     gWindowWidth = width;
     gWindowHeight = height;
+}
+
+std::string ChooseProjectFileToOpen(const char *title) {
+    wchar_t filePath[32768]{};
+    wchar_t wideTitle[128]{};
+    MultiByteToWideChar(CP_UTF8, 0, title, -1, wideTitle,
+                        static_cast<int>(std::size(wideTitle)));
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = glfwGetWin32Window(gWindow);
+    dialog.lpstrFilter = L"Map Drawer files (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0";
+    dialog.lpstrFile = filePath;
+    dialog.nMaxFile = static_cast<DWORD>(std::size(filePath));
+    dialog.lpstrTitle = wideTitle;
+    dialog.lpstrDefExt = L"txt";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&dialog)) return {};
+    return std::filesystem::path(filePath).string();
+}
+
+std::string ChooseProjectFileToSave(const char *title, const std::string &suggestedName) {
+    wchar_t filePath[32768]{};
+    std::filesystem::path suggested(suggestedName);
+    std::wstring wideSuggested = suggested.filename().wstring();
+    std::copy_n(wideSuggested.c_str(),
+                std::min(wideSuggested.size(), std::size(filePath) - 1), filePath);
+    wchar_t wideTitle[128]{};
+    MultiByteToWideChar(CP_UTF8, 0, title, -1, wideTitle,
+                        static_cast<int>(std::size(wideTitle)));
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = glfwGetWin32Window(gWindow);
+    dialog.lpstrFilter = L"Map Drawer files (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0";
+    dialog.lpstrFile = filePath;
+    dialog.nMaxFile = static_cast<DWORD>(std::size(filePath));
+    dialog.lpstrTitle = wideTitle;
+    dialog.lpstrDefExt = L"txt";
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&dialog)) return {};
+    return std::filesystem::path(filePath).string();
 }
 
 uint64_t TileKey(int32_t col, int32_t row) {
@@ -436,8 +486,48 @@ void OpenDungeonTab(int index) {
     UpdateWindowTitle();
 }
 
+void StartStandaloneDungeon() {
+    gProjectDocument = ProjectDocument{};
+    gProjectDocument.standaloneDungeon = true;
+    Dungeon dungeon;
+    dungeon.name = "Untitled Dungeon";
+    gDungeons.push_back(std::move(dungeon));
+    gProjectFile.clear();
+    gEditor.ResetForLoadedDocument();
+    gEditorTab = EditorTab::World;
+    gActiveDungeonIndex = -1;
+    gSelectedDungeonPoiIndex = -1;
+    gDungeonManagerIndex = -1;
+    gPlacementMode = PlacementMode::None;
+    OpenDungeonTab(0);
+    MarkProjectDirty();
+    LOG_INFO("Created a new standalone dungeon map");
+}
+
+void StartWorldDocument() {
+    gProjectDocument = ProjectDocument{};
+    gProjectFile = kDefaultProjectFile;
+    gEditor.ResetForLoadedDocument();
+    gEditorTab = EditorTab::World;
+    gActiveDungeonIndex = -1;
+    gSelectedDungeonPoiIndex = -1;
+    gDungeonManagerIndex = -1;
+    gPlacementMode = PlacementMode::None;
+    gCameraX = -kUiWidth;
+    gCameraY = 0.0;
+    gZoom = 1.0;
+    SaveProjectConfig();
+    ++gSceneRevision;
+    UpdateWindowTitle();
+}
+
 void ReturnToWorldTab() {
     if (gEditorTab == EditorTab::World) return;
+    if (gProjectDocument.standaloneDungeon) {
+        gMainMenuOpen = true;
+        UpdateWindowTitle();
+        return;
+    }
     gEditorTab = EditorTab::World;
     gDungeonPlacementMode = DungeonPlacementMode::None;
     gHistory.Clear();
@@ -874,11 +964,57 @@ void OpenDungeonManager() {
         gPois[static_cast<size_t>(gSelectedDungeonPoiIndex)].kind != PoiKind::Dungeon) {
         gInfoTitle = "SELECT A DUNGEON";
         gInfoLines = {"CLICK A DUNGEON POI ON THE OVERWORLD FIRST",
-                      "DUNGEON MAPS CAN ONLY BE OPENED THROUGH THEIR POI MARKER"};
+                      "THEN CREATE A MAP OR LINK A STANDALONE DUNGEON FILE"};
         OpenModal(ModalType::Info, {});
         return;
     }
     OpenDungeonManagerForPoi(gSelectedDungeonPoiIndex);
+}
+
+void LinkDungeonFileToSelectedPoi() {
+    if (gSelectedDungeonPoiIndex < 0 ||
+        gSelectedDungeonPoiIndex >= static_cast<int>(gPois.size()))
+        return;
+    std::string path = ChooseProjectFileToOpen("Select a dungeon map");
+    if (path.empty()) return;
+
+    ProjectDocument source;
+    int version = 0;
+    std::string error;
+    if (!LoadProjectDocument(path, source, version, error) || !source.standaloneDungeon ||
+        source.dungeons.size() != 1) {
+        LOG_ERROR("Could not link dungeon file %s: %s", path.c_str(),
+                  error.empty() ? "the file is not a standalone dungeon map" : error.c_str());
+        gInfoTitle = "CANNOT LINK DUNGEON";
+        gInfoLines = {error.empty() ? "SELECT A STANDALONE DUNGEON MAP FILE"
+                                    : error};
+        OpenModal(ModalType::Info, {});
+        return;
+    }
+
+    const PointOfInterest &poi = gPois[static_cast<size_t>(gSelectedDungeonPoiIndex)];
+    Dungeon linked = source.dungeons.front();
+    linked.worldCol = poi.col;
+    linked.worldRow = poi.row;
+    linked.sourceFile = path;
+    int dungeonIndex = FindDungeonAtWorldTile(poi.col, poi.row);
+    if (dungeonIndex >= 0)
+        gDungeons[static_cast<size_t>(dungeonIndex)] = std::move(linked);
+    else {
+        gDungeons.push_back(std::move(linked));
+        dungeonIndex = static_cast<int>(gDungeons.size()) - 1;
+    }
+    gPois[static_cast<size_t>(gSelectedDungeonPoiIndex)].name =
+        gDungeons[static_cast<size_t>(dungeonIndex)].name;
+    gPois[static_cast<size_t>(gSelectedDungeonPoiIndex)].description =
+        gDungeons[static_cast<size_t>(dungeonIndex)].description;
+    gDungeonManagerIndex = dungeonIndex;
+    gModalType = ModalType::None;
+    ++gSceneRevision;
+    MarkProjectDirty();
+    LOG_INFO("Linked dungeon '%s' from %s",
+             gDungeons[static_cast<size_t>(dungeonIndex)].name.c_str(), path.c_str());
+    OpenDungeonTab(dungeonIndex);
 }
 
 void OpenNewDungeonForm() {
@@ -996,7 +1132,9 @@ void OpenKeybindHelp() {
             "HOME                 FIT THE DUNGEON MAP",
             "G                    TOGGLE THE SQUARE GRID",
             "CTRL+S / CTRL+L      SAVE / LOAD THE PROJECT",
-            "ESC                  RETURN TO THE WORLD TAB",
+            gProjectDocument.standaloneDungeon
+                ? "ESC                  RETURN TO THE MAIN MENU"
+                : "ESC                  RETURN TO THE WORLD TAB",
             "ENTRANCE AND EXIT TOOLS ONLY EXIST IN THE DUNGEON TAB",
         };
         OpenModal(ModalType::Info, {});
@@ -1034,7 +1172,7 @@ void OpenKeybindHelp() {
         "DELETE MARKER/SELECTION   X DELETE ROUTE",
         "CTRL+C/X/V COPY / CUT / PASTE SELECTION",
         "CTRL+Z/Y UNDO / REDO   C CLEAR ACTIVE LAYER",
-        "CTRL+S/L SAVE / LOAD   P EXPORT   ESC CLOSE / QUIT",
+        "CTRL+S/L SAVE / LOAD   P EXPORT   ESC CLOSE / MENU",
         "PRESS ? OR USE THE HELP BUTTON TO OPEN THIS MENU",
     };
     OpenModal(ModalType::Info, {});
@@ -1276,7 +1414,13 @@ void CloseModal(bool accept) {
         gInfoLines.clear();
         if (accept) {
             if (action == ConfirmAction::ClearLayer) ClearActiveLayerNow();
-            else if (action == ConfirmAction::LoadProject) LoadProjectFromPath(gProjectFile, true);
+            else if (action == ConfirmAction::LoadProject) {
+                if (LoadProjectFromPath(gPendingLoadFile, false)) {
+                    gProjectFile = gPendingLoadFile;
+                    SaveProjectConfig();
+                }
+                gPendingLoadFile.clear();
+            }
             else if (action == ConfirmAction::OverwriteProject) SaveProjectNow();
             else if (action == ConfirmAction::GenerateRelief) GenerateTerrainRelief();
             else if (action == ConfirmAction::RecoverAutosave) {
@@ -1286,6 +1430,7 @@ void CloseModal(bool accept) {
                 }
             }
         }
+        if (action == ConfirmAction::LoadProject) gPendingLoadFile.clear();
         UpdateWindowTitle();
         return;
     }
@@ -1413,6 +1558,7 @@ void CloseModal(bool accept) {
         UpdateWindowTitle();
         return;
     }
+    bool openDungeonManager = false;
     if (accept) {
         if (gModalType == ModalType::Region) {
             int id = gNextRegionId++;
@@ -1442,6 +1588,10 @@ void CloseModal(bool accept) {
             poi.description = gModalFields[1];
             gPois.push_back(poi);
             LOG_INFO("%s '%s' placed at (%d, %d)", PoiKindName(poi.kind), poi.name.c_str(), poi.col, poi.row);
+            if (poi.kind == PoiKind::Dungeon) {
+                gSelectedDungeonPoiIndex = static_cast<int>(gPois.size()) - 1;
+                openDungeonManager = true;
+            }
         } else if (gModalType == ModalType::Encounter) {
             Encounter encounter;
             encounter.col = gModalCol;
@@ -1480,7 +1630,8 @@ void CloseModal(bool accept) {
     gInfoLines.clear();
     gModalField = 0;
     gEditingEncounterIndex = -1;
-    UpdateWindowTitle();
+    if (openDungeonManager) OpenDungeonManagerForPoi(gSelectedDungeonPoiIndex);
+    else UpdateWindowTitle();
 }
 
 // Removes whichever world marker sits at the cursor tile.
@@ -1641,6 +1792,10 @@ void ExportScreenshot() {
 }
 
 void UpdateWindowTitle() {
+    if (gMainMenuOpen) {
+        glfwSetWindowTitle(gWindow, "DND Map Drawer - Main Menu");
+        return;
+    }
     if (gEditorTab == EditorTab::Dungeon) {
         Dungeon *dungeon = ActiveDungeon();
         auto [col, row] = DungeonCursorTile();
@@ -1947,8 +2102,36 @@ bool SaveProjectToPath(const std::string &path, bool announce) {
     return true;
 }
 
+bool SaveLinkedDungeonFiles() {
+    if (gProjectDocument.standaloneDungeon) return true;
+    bool allSaved = true;
+    for (const Dungeon &dungeon : gDungeons) {
+        if (dungeon.sourceFile.empty()) continue;
+        ProjectDocument standalone;
+        standalone.standaloneDungeon = true;
+        Dungeon copy = dungeon;
+        copy.sourceFile.clear();
+        standalone.dungeons.push_back(std::move(copy));
+        std::string error;
+        if (!SaveProjectDocument(dungeon.sourceFile, standalone, error)) {
+            LOG_ERROR("Could not update linked dungeon %s: %s",
+                      dungeon.sourceFile.c_str(), error.c_str());
+            allSaved = false;
+        } else
+            LOG_INFO("Updated linked dungeon file %s", dungeon.sourceFile.c_str());
+    }
+    return allSaved;
+}
+
 void SaveProjectNow() {
     namespace fs = std::filesystem;
+    if (gProjectFile.empty()) {
+        gProjectFile = ChooseProjectFileToSave(
+            gProjectDocument.standaloneDungeon ? "Save dungeon map" : "Save world map",
+            gProjectDocument.standaloneDungeon ? "dungeon_map.txt" : "world_map.txt");
+        if (gProjectFile.empty()) return;
+        SaveProjectConfig();
+    }
     std::error_code ec;
     if (fs::exists(gProjectFile, ec)) {
         fs::create_directories(kBackupDirectory, ec);
@@ -1969,10 +2152,15 @@ void SaveProjectNow() {
         if (ec) LOG_WARN("Could not create backup %s: %s", backup.string().c_str(), ec.message().c_str());
         else LOG_INFO("Backup created: %s", backup.string().c_str());
     }
-    if (SaveProjectToPath(gProjectFile, true)) gProjectDirty = false;
+    bool linkedDungeonsSaved = SaveLinkedDungeonFiles();
+    if (SaveProjectToPath(gProjectFile, true) && linkedDungeonsSaved) gProjectDirty = false;
 }
 
 void RequestProjectSave() {
+    if (gProjectFile.empty()) {
+        SaveProjectNow();
+        return;
+    }
     std::error_code ec;
     if (std::filesystem::exists(gProjectFile, ec)) {
         OpenConfirmation(ConfirmAction::OverwriteProject, "OVERWRITE PROJECT",
@@ -1996,11 +2184,11 @@ void LoadProjectConfig() {
     std::string filename;
     if (!in || !std::getline(in, filename) || filename.empty()) return;
     std::filesystem::path candidate(filename);
-    if (candidate.has_parent_path() || candidate.extension() != ".txt") {
+    if (candidate.extension() != ".txt") {
         LOG_WARN("Ignoring invalid project filename in %s", kConfigFile);
         return;
     }
-    gProjectFile = candidate.filename().string();
+    gProjectFile = candidate.string();
 }
 
 bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
@@ -2084,7 +2272,8 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
     gMeasureStage = 0;
     LOG_INFO("Project loaded from %s (version %d, %zu terrain tiles, %zu elevation tiles)",
              path.c_str(), version, gMapData.size(), gElevationData.size());
-    UpdateWindowTitle();
+    if (gProjectDocument.standaloneDungeon && !gDungeons.empty()) OpenDungeonTab(0);
+    else UpdateWindowTitle();
     return true;
 }
 
@@ -2169,13 +2358,20 @@ void GenerateTerrainRelief() {
     LOG_INFO("Generated terrain-based relief for %zu map tiles", gMapData.size());
 }
 
-void RequestProjectLoad() {
+bool RequestProjectLoad() {
+    std::string selectedFile = ChooseProjectFileToOpen("Open a map");
+    if (selectedFile.empty()) return false;
     if (gProjectDirty) {
+        gPendingLoadFile = selectedFile;
         OpenConfirmation(ConfirmAction::LoadProject, "DISCARD CHANGES",
-                         {"LOAD: " + gProjectFile, "UNSAVED CHANGES WILL BE LOST"});
+                         {"LOAD: " + std::filesystem::path(selectedFile).filename().string(),
+                          "UNSAVED CHANGES WILL BE LOST"});
     } else {
-        LoadProjectFromPath(gProjectFile, true);
+        if (!LoadProjectFromPath(selectedFile, false)) return false;
+        gProjectFile = selectedFile;
+        SaveProjectConfig();
     }
+    return true;
 }
 
 void CheckForRecoveryAutosave() {
@@ -2377,6 +2573,63 @@ void AddUiButton(std::vector<float> &vertices, float x, float y, float w, float 
 void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
     std::vector<float> vertices;
     gUiHits.clear();
+
+    if (gMainMenuOpen) {
+        const float width = static_cast<float>(gWindowWidth);
+        const float height = static_cast<float>(gWindowHeight);
+        const float cardWidth = std::min(580.0f, width - 80.0f);
+        const float cardHeight = 600.0f;
+        const float cardX = (width - cardWidth) * 0.5f;
+        const float cardY = std::max(40.0f, (height - cardHeight) * 0.5f);
+
+        AppendUiRect(vertices, 0.0f, 0.0f, width, height, {0.035f, 0.045f, 0.060f});
+        AppendUiRect(vertices, 0.0f, 0.0f, width, height * 0.30f,
+                     {0.080f, 0.115f, 0.145f});
+        AppendUiRect(vertices, cardX, cardY, cardWidth, cardHeight,
+                     {0.075f, 0.085f, 0.105f}, 0.99f);
+        AppendUiRect(vertices, cardX, cardY, 5.0f, cardHeight,
+                     {0.90f, 0.66f, 0.22f});
+
+        AppendUiText(vertices, "MAP DRAWER", cardX + 42.0f, cardY + 38.0f, 4.2f,
+                     {0.94f, 0.78f, 0.34f});
+        AppendUiText(vertices, "CHOOSE WHAT YOU WANT TO WORK ON", cardX + 44.0f,
+                     cardY + 94.0f, 1.7f, {0.68f, 0.74f, 0.82f}, 46);
+
+        auto addTask = [&](float y, const char *number, const char *title,
+                           const char *description, UiAction action, const Vec3 &accent) {
+            AppendUiRect(vertices, cardX + 38.0f, y, cardWidth - 76.0f, 102.0f,
+                         {0.105f, 0.125f, 0.155f});
+            AppendUiRect(vertices, cardX + 38.0f, y, 7.0f, 102.0f, accent);
+            AppendUiText(vertices, number, cardX + 62.0f, y + 25.0f, 2.8f, accent, 2);
+            AppendUiText(vertices, title, cardX + 112.0f, y + 20.0f, 2.25f,
+                         {0.94f, 0.95f, 0.97f}, 34);
+            AppendUiText(vertices, description, cardX + 112.0f, y + 58.0f, 1.35f,
+                         {0.65f, 0.70f, 0.78f}, 58);
+            gUiHits.push_back({cardX + 38.0f, y, cardWidth - 76.0f, 102.0f, action, 0});
+        };
+
+        addTask(cardY + 132.0f, "1", "WORLD MAP",
+                "TERRAIN, REGIONS, ROUTES AND LOCATIONS", UiAction::MainWorld,
+                {0.32f, 0.72f, 0.48f});
+        addTask(cardY + 248.0f, "2", "DUNGEON MAP",
+                "GO STRAIGHT TO A STANDALONE DUNGEON", UiAction::MainDungeon,
+                {0.88f, 0.38f, 0.20f});
+        addTask(cardY + 364.0f, "3", "LOAD MAP",
+                "CHOOSE ANY SAVED WORLD OR DUNGEON FILE", UiAction::MainLoad,
+                {0.30f, 0.62f, 0.90f});
+
+        AddUiButton(vertices, cardX + 38.0f, cardY + 500.0f, cardWidth - 76.0f,
+                    40.0f, "QUIT", UiAction::MainQuit);
+        AppendUiText(vertices, "PRESS 1, 2 OR 3    ESC QUITS", cardX + 112.0f,
+                     cardY + 560.0f, 1.35f, {0.50f, 0.55f, 0.63f}, 44);
+
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+                     vertices.data(), GL_DYNAMIC_DRAW);
+        outVertexCount = static_cast<GLsizei>(vertices.size() / 6);
+        return;
+    }
+
     double cursorX = 0.0, cursorY = 0.0;
     glfwGetCursorPos(gWindow, &cursorX, &cursorY);
     if (gModalType == ModalType::None && cursorX >= kUiWidth) {
@@ -2505,7 +2758,9 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                 0, gPlacementMode == PlacementMode::Encounter);
 
     headingText("PROJECT", 530.0f);
-    std::string projectLabel = gProjectFile;
+    std::string projectLabel = gProjectFile.empty()
+                                   ? "NOT SAVED YET"
+                                   : std::filesystem::path(gProjectFile).filename().string();
     if (projectLabel.size() > 24) projectLabel = projectLabel.substr(0, 21) + "...";
     AppendUiText(vertices, projectLabel, x0 + 78.0f, 532.0f, 1.2f, {0.62f, 0.67f, 0.74f}, 24);
     AddUiButton(vertices, x0, 544.0f, 57.0f, h, "SAVE", UiAction::Save);
@@ -2622,7 +2877,9 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
         AppendUiRect(vertices, kUiWidth - 2.0f, 0.0f, 2.0f, static_cast<float>(gWindowHeight),
                      {0.28f, 0.34f, 0.42f});
         AppendUiText(vertices, "DUNGEON", 12.0f, 12.0f, 2.5f, {0.88f, 0.34f, 0.18f});
-        AddUiButton(vertices, 116.0f, 8.0f, 62.0f, 24.0f, "WORLD", UiAction::DungeonReturnWorld);
+        AddUiButton(vertices, 116.0f, 8.0f, 62.0f, 24.0f,
+                    gProjectDocument.standaloneDungeon ? "MENU" : "WORLD",
+                    UiAction::DungeonReturnWorld);
         AddUiButton(vertices, 183.0f, 8.0f, 71.0f, 24.0f, "HELP", UiAction::Help);
 
         Dungeon *dungeon = ActiveDungeon();
@@ -2830,6 +3087,12 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                 std::string details = dungeon.description.empty() ? "NO DESCRIPTION" : dungeon.description;
                 AppendUiText(vertices, details, mx + 24.0f, my + 174.0f, 1.5f,
                              {0.70f, 0.74f, 0.80f}, 68);
+                if (!dungeon.sourceFile.empty())
+                    AppendUiText(vertices,
+                                 "LINKED FILE " +
+                                     std::filesystem::path(dungeon.sourceFile).filename().string(),
+                                 mx + 24.0f, my + 204.0f, 1.4f,
+                                 {0.42f, 0.72f, 0.92f}, 62);
             } else {
                 AppendUiText(vertices, selectedPoi ? selectedPoi->name : "DUNGEON POI",
                              mx + 24.0f, my + 76.0f, 2.2f, {0.92f, 0.76f, 0.35f}, 46);
@@ -2841,6 +3104,8 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
             AddUiButton(vertices, mx + 24.0f, my + mh - 48.0f, 118.0f, 28.0f,
                         hasMap ? "OPEN MAP" : "CREATE MAP",
                         hasMap ? UiAction::DungeonManagerOpen : UiAction::DungeonManagerNew);
+            AddUiButton(vertices, mx + 154.0f, my + mh - 48.0f, 118.0f, 28.0f,
+                        hasMap ? "RELINK FILE" : "LINK FILE", UiAction::DungeonManagerLink);
             AddUiButton(vertices, mx + mw - 112.0f, my + mh - 48.0f, 88.0f, 28.0f,
                         "CLOSE", UiAction::ModalCancel);
         } else if (gModalType == ModalType::Info) {
@@ -2958,6 +3223,32 @@ void HandleUiAction(const UiHit &hit) {
     gUseUiTarget = true;
     switch (hit.action) {
         case UiAction::None: break;
+        case UiAction::MainWorld:
+            gMainMenuOpen = false;
+            if (!gEditorSessionStarted || gProjectDocument.standaloneDungeon) StartWorldDocument();
+            else if (gEditorTab == EditorTab::Dungeon) ReturnToWorldTab();
+            gEditorSessionStarted = true;
+            gPlacementMode = PlacementMode::None;
+            break;
+        case UiAction::MainDungeon:
+            gMainMenuOpen = false;
+            if (gEditorSessionStarted && gProjectDocument.standaloneDungeon && !gDungeons.empty())
+                OpenDungeonTab(0);
+            else StartStandaloneDungeon();
+            gEditorSessionStarted = true;
+            break;
+        case UiAction::MainLoad:
+            gMainMenuOpen = false;
+            if (gConfirmAction == ConfirmAction::RecoverAutosave) {
+                gModalType = ModalType::None;
+                gConfirmAction = ConfirmAction::None;
+                gInfoTitle.clear();
+                gInfoLines.clear();
+            }
+            if (!RequestProjectLoad()) gMainMenuOpen = true;
+            else gEditorSessionStarted = true;
+            break;
+        case UiAction::MainQuit: glfwSetWindowShouldClose(gWindow, GLFW_TRUE); break;
         case UiAction::SetMode:
             gPaintMode = static_cast<PaintMode>(hit.value);
             gDungeonPlacementMode = DungeonPlacementMode::None;
@@ -3117,6 +3408,7 @@ void HandleUiAction(const UiHit &hit) {
             }
             break;
         case UiAction::DungeonManagerNew: OpenNewDungeonForm(); break;
+        case UiAction::DungeonManagerLink: LinkDungeonFileToSelectedPoi(); break;
     }
     gUseUiTarget = false;
     UpdateWindowTitle();
@@ -3131,13 +3423,13 @@ bool HandleGuiPress() {
             return true;
         }
     }
-    return gModalType != ModalType::None || mouseX < kUiWidth;
+    return gMainMenuOpen || gModalType != ModalType::None || mouseX < kUiWidth;
 }
 
 bool CursorOverGui() {
     double mouseX = 0.0, mouseY = 0.0;
     glfwGetCursorPos(gWindow, &mouseX, &mouseY);
-    if (gModalType != ModalType::None || mouseX < kUiWidth) return true;
+    if (gMainMenuOpen || gModalType != ModalType::None || mouseX < kUiWidth) return true;
     for (const auto &hit : gUiHits)
         if (mouseX >= hit.x && mouseX <= hit.x + hit.w && mouseY >= hit.y && mouseY <= hit.y + hit.h)
             return true;
@@ -3427,6 +3719,18 @@ void SelectTool(ToolMode mode) {
 }
 
 void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int mods) {
+    if (gMainMenuOpen) {
+        if (action != GLFW_PRESS) return;
+        if (key == GLFW_KEY_1 || key == GLFW_KEY_KP_1)
+            HandleUiAction({0.0f, 0.0f, 0.0f, 0.0f, UiAction::MainWorld, 0});
+        else if (key == GLFW_KEY_2 || key == GLFW_KEY_KP_2)
+            HandleUiAction({0.0f, 0.0f, 0.0f, 0.0f, UiAction::MainDungeon, 0});
+        else if (key == GLFW_KEY_3 || key == GLFW_KEY_KP_3 || key == GLFW_KEY_L)
+            HandleUiAction({0.0f, 0.0f, 0.0f, 0.0f, UiAction::MainLoad, 0});
+        else if (key == GLFW_KEY_ESCAPE || key == GLFW_KEY_Q)
+            glfwSetWindowShouldClose(window, GLFW_TRUE);
+        return;
+    }
     if (gModalType != ModalType::None) {
         if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
         if (gModalType == ModalType::DungeonManager) {
@@ -3543,7 +3847,8 @@ void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int 
     } else if (key == GLFW_KEY_ESCAPE && gMeasureStage != 0) {
         gMeasureStage = 0;
     } else if (key == GLFW_KEY_ESCAPE) {
-        glfwSetWindowShouldClose(window, GLFW_TRUE);
+        gMainMenuOpen = true;
+        gPlacementMode = PlacementMode::None;
     } else if (key >= GLFW_KEY_0 && key <= GLFW_KEY_9 &&
                key - GLFW_KEY_0 < static_cast<int>(gTerrainDefinitions.size())) {
         gBrush = key - GLFW_KEY_0;
@@ -3667,7 +3972,7 @@ void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int 
 
 // Continuous WASD/arrow-key panning; call once per frame with the elapsed time.
 void UpdateCameraPan(double deltaSeconds) {
-    if (gModalType != ModalType::None) return;
+    if (gMainMenuOpen || gModalType != ModalType::None) return;
     double distance = (kPanSpeed / gZoom) * deltaSeconds;
     if (glfwGetKey(gWindow, GLFW_KEY_W) == GLFW_PRESS || glfwGetKey(gWindow, GLFW_KEY_UP) == GLFW_PRESS)
         gCameraY -= distance;
@@ -4549,7 +4854,7 @@ int main() {
     LOG_INFO("                      Load falls back to legacy multi-file projects when needed");
     LOG_INFO("  Autosave          : recovery copy written every five minutes while modified");
     LOG_INFO("  Help / ?          : show the in-application keybind reference");
-    LOG_INFO("  Escape            : quit");
+    LOG_INFO("  Escape            : cancel the current action or open the main menu");
 
     double lastTime = glfwGetTime();
     double lastAutosaveTime = lastTime;

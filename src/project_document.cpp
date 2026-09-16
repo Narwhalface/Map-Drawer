@@ -76,6 +76,7 @@ bool SaveProjectDocument(const std::string &path, const ProjectDocument &documen
     }
     output << std::setprecision(17);
     output << "MAP_DRAWER_PROJECT " << kProjectVersion << '\n';
+    output << "DOCUMENT " << (document.standaloneDungeon ? "DUNGEON" : "WORLD") << '\n';
     output << "GRID " << (document.hexGrid ? 1 : 0) << '\n';
     output << "TERRAIN_TYPES " << document.terrainDefinitions.size() << '\n';
     for (const TerrainDefinition &terrain : document.terrainDefinitions) {
@@ -123,7 +124,8 @@ bool SaveProjectDocument(const std::string &path, const ProjectDocument &documen
                << (dungeon.hasEntrance ? 1 : 0) << ' ' << dungeon.entranceCol << ' '
                << dungeon.entranceRow << ' ' << (dungeon.hasExit ? 1 : 0) << ' '
                << dungeon.exitCol << ' ' << dungeon.exitRow << ' ' << dungeon.tiles.size() << ' '
-               << std::quoted(dungeon.name) << ' ' << std::quoted(dungeon.description) << '\n';
+               << std::quoted(dungeon.name) << ' ' << std::quoted(dungeon.description) << ' '
+               << std::quoted(dungeon.sourceFile) << '\n';
         for (const auto &[key, value] : dungeon.tiles) {
             auto [column, row] = grid_geometry::Unpack(key);
             output << column << ' ' << row << ' ' << static_cast<int>(value) << '\n';
@@ -167,6 +169,17 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
         loadedVersion > kProjectVersion) {
         errorMessage = "unsupported or invalid project header";
         return false;
+    }
+
+    if (loadedVersion >= 9) {
+        std::string documentKind;
+        input >> tag >> documentKind;
+        if (!input || tag != "DOCUMENT" ||
+            (documentKind != "WORLD" && documentKind != "DUNGEON")) {
+            errorMessage = "invalid DOCUMENT section";
+            return false;
+        }
+        loaded.standaloneDungeon = documentKind == "DUNGEON";
     }
 
     int gridValue = 0;
@@ -338,6 +351,7 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
             input >> dungeon.worldCol >> dungeon.worldRow >> hasEntrance >> dungeon.entranceCol
                   >> dungeon.entranceRow >> hasExit >> dungeon.exitCol >> dungeon.exitRow
                   >> tileCount >> std::quoted(dungeon.name) >> std::quoted(dungeon.description);
+            if (loadedVersion >= 9) input >> std::quoted(dungeon.sourceFile);
             if (!input || dungeon.name.empty() || (hasEntrance != 0 && hasEntrance != 1) ||
                 (hasExit != 0 && hasExit != 1)) {
                 errorMessage = "invalid dungeon metadata";
@@ -432,10 +446,16 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
         return false;
     }
 
+    if (loaded.standaloneDungeon && loaded.dungeons.size() != 1) {
+        errorMessage = "a standalone dungeon file must contain exactly one dungeon map";
+        return false;
+    }
+
     // Dungeon POIs are the overworld identity and access point for dungeon maps. Projects
     // created before this relationship was enforced may only contain the dungeon record, so
     // synthesize the matching marker during load rather than leaving that map unreachable.
     for (const Dungeon &dungeon : loaded.dungeons) {
+        if (loaded.standaloneDungeon) break;
         const auto poi = std::find_if(
             loaded.pointsOfInterest.begin(), loaded.pointsOfInterest.end(),
             [&](const PointOfInterest &candidate) {

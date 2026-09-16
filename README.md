@@ -62,7 +62,9 @@ directory from which the application is launched. Starting it from the project d
 those files together at the repository root.
 
 Use the in-application **HELP** button or press `Shift+/` (`?`) to view the complete controls and
-keybindings.
+keybindings. On startup, choose the world-map editor, create a standalone dungeon map, or use the
+file picker to load any saved map. Press `Escape` from the world editor to return to this menu.
+Dungeon POIs on world maps can either create an embedded dungeon or link a standalone dungeon file.
 
 ## Run the tests
 
