@@ -6,6 +6,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 #include <utility>
 
 namespace {
@@ -76,7 +77,10 @@ bool SaveProjectDocument(const std::string &path, const ProjectDocument &documen
     }
     output << std::setprecision(17);
     output << "MAP_DRAWER_PROJECT " << kProjectVersion << '\n';
-    output << "DOCUMENT " << (document.standaloneDungeon ? "DUNGEON" : "WORLD") << '\n';
+    output << "DOCUMENT "
+           << (document.standaloneDungeon ? "DUNGEON" :
+               document.standaloneEncounter ? "ENCOUNTER" :
+               document.standaloneCreature ? "CREATURE" : "WORLD") << '\n';
     output << "GRID " << (document.hexGrid ? 1 : 0) << '\n';
     output << "TERRAIN_TYPES " << document.terrainDefinitions.size() << '\n';
     for (const TerrainDefinition &terrain : document.terrainDefinitions) {
@@ -116,6 +120,58 @@ bool SaveProjectDocument(const std::string &path, const ProjectDocument &documen
     for (const Encounter &encounter : document.encounters) {
         output << encounter.col << ' ' << encounter.row << ' ' << std::quoted(encounter.name) << ' '
                << std::quoted(encounter.description) << '\n';
+        output << "ENCOUNTER_CREATURES " << encounter.creatures.size() << '\n';
+        for (const EncounterCreature &creature : encounter.creatures)
+            output << creature.count << ' ' << std::quoted(creature.name) << ' '
+                   << std::quoted(creature.sourceFile) << '\n';
+        output << "ENCOUNTER_EFFECTS " << encounter.effects.size() << '\n';
+        for (const EncounterEffect &effect : encounter.effects)
+            output << std::quoted(effect.description) << '\n';
+        output << "ENCOUNTER_TABLES " << encounter.rollTables.size() << '\n';
+        for (const EncounterRollTable &table : encounter.rollTables) {
+            output << table.dieSides << ' ' << table.entries.size() << ' '
+                   << std::quoted(table.name) << '\n';
+            for (const EncounterTableEntry &entry : table.entries)
+                output << entry.minimumRoll << ' ' << entry.maximumRoll << ' '
+                       << std::quoted(entry.result) << '\n';
+        }
+        output << "ENCOUNTER_DETAILS " << std::quoted(encounter.sourceFile) << ' '
+               << std::quoted(encounter.trigger) << ' ' << std::quoted(encounter.objective) << ' '
+               << std::quoted(encounter.environment) << ' '
+               << std::quoted(encounter.gameMasterNotes) << ' ' << std::quoted(encounter.rewards) << ' '
+               << std::quoted(encounter.successOutcome) << ' '
+               << std::quoted(encounter.failureOutcome) << '\n';
+        output << "ENCOUNTER_RUN " << encounter.currentRound << ' '
+               << encounter.activeParticipant << ' ' << encounter.participants.size() << '\n';
+        for (const EncounterParticipant &participant : encounter.participants)
+            output << participant.initiative << ' ' << participant.currentHitPoints << ' '
+                   << (participant.defeated ? 1 : 0) << ' ' << std::quoted(participant.name) << ' '
+                   << std::quoted(participant.conditions) << '\n';
+    }
+
+    output << "CREATURES " << document.creatures.size() << '\n';
+    for (const CreatureStatBlock &creature : document.creatures) {
+        output << std::quoted(creature.name) << ' ' << std::quoted(creature.classification) << ' '
+               << std::quoted(creature.armorClass) << ' ' << std::quoted(creature.hitPoints) << ' '
+               << std::quoted(creature.speed);
+        for (int score : creature.abilityScores) output << ' ' << score;
+        output << ' '
+               << std::quoted(creature.savesAndSkills) << ' '
+               << std::quoted(creature.sensesAndLanguages) << ' '
+               << std::quoted(creature.challenge) << ' ' << std::quoted(creature.traits) << ' '
+               << std::quoted(creature.actions) << ' ' << std::quoted(creature.reactions) << ' '
+               << std::quoted(creature.legendaryActions) << '\n';
+        output << "CREATURE_ABILITIES " << creature.specialAbilities.size() << '\n';
+        for (const CreatureStatBlock::Ability &ability : creature.specialAbilities)
+            output << std::quoted(ability.name) << ' ' << std::quoted(ability.description) << '\n';
+        output << "CREATURE_DETAILS " << std::quoted(creature.damageVulnerabilities) << ' '
+               << std::quoted(creature.damageResistances) << ' '
+               << std::quoted(creature.damageImmunities) << ' '
+               << std::quoted(creature.conditionImmunities) << ' '
+               << std::quoted(creature.proficiencyBonus) << ' '
+               << std::quoted(creature.passivePerception) << ' '
+               << std::quoted(creature.spellcasting) << ' '
+               << std::quoted(creature.portraitFile) << '\n';
     }
 
     output << "DUNGEONS " << document.dungeons.size() << '\n';
@@ -137,6 +193,11 @@ bool SaveProjectDocument(const std::string &path, const ProjectDocument &documen
         }
         WriteTileLayer(output, "DUNGEON_ELEVATION", dungeon.elevation);
         WriteTileLayer(output, "DUNGEON_FOG", dungeon.fog);
+        output << "DUNGEON_MARKERS " << dungeon.markers.size() << '\n';
+        for (const DungeonMarker &marker : dungeon.markers)
+            output << marker.col << ' ' << marker.row << ' ' << static_cast<int>(marker.kind) << ' '
+                   << (marker.gameMasterOnly ? 1 : 0) << ' ' << std::quoted(marker.name) << ' '
+                   << std::quoted(marker.description) << ' ' << std::quoted(marker.sourceFile) << '\n';
     }
 
     output << "ROUTES " << document.routes.size() << '\n';
@@ -175,11 +236,15 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
         std::string documentKind;
         input >> tag >> documentKind;
         if (!input || tag != "DOCUMENT" ||
-            (documentKind != "WORLD" && documentKind != "DUNGEON")) {
+            (documentKind != "WORLD" && documentKind != "DUNGEON" &&
+             (loadedVersion < 11 || documentKind != "ENCOUNTER") &&
+             (loadedVersion < 12 || documentKind != "CREATURE"))) {
             errorMessage = "invalid DOCUMENT section";
             return false;
         }
         loaded.standaloneDungeon = documentKind == "DUNGEON";
+        loaded.standaloneEncounter = documentKind == "ENCOUNTER";
+        loaded.standaloneCreature = documentKind == "CREATURE";
     }
 
     int gridValue = 0;
@@ -332,7 +397,196 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
                 errorMessage = "invalid encounter data";
                 return false;
             }
+            if (loadedVersion >= 10) {
+                std::size_t creatureCount = 0;
+                if (!ReadSectionCount(input, "ENCOUNTER_CREATURES", creatureCount) ||
+                    creatureCount > 1000) {
+                    errorMessage = "invalid ENCOUNTER_CREATURES section";
+                    return false;
+                }
+                encounter.creatures.reserve(creatureCount);
+                for (std::size_t creatureIndex = 0; creatureIndex < creatureCount; ++creatureIndex) {
+                    EncounterCreature creature;
+                    input >> creature.count >> std::quoted(creature.name);
+                    if (loadedVersion >= 12) input >> std::quoted(creature.sourceFile);
+                    if (!input || creature.count <= 0 || creature.count > 10000 ||
+                        creature.name.empty()) {
+                        errorMessage = "invalid encounter creature";
+                        return false;
+                    }
+                    encounter.creatures.push_back(std::move(creature));
+                }
+                std::size_t effectCount = 0;
+                if (!ReadSectionCount(input, "ENCOUNTER_EFFECTS", effectCount) ||
+                    effectCount > 1000) {
+                    errorMessage = "invalid ENCOUNTER_EFFECTS section";
+                    return false;
+                }
+                encounter.effects.reserve(effectCount);
+                for (std::size_t effectIndex = 0; effectIndex < effectCount; ++effectIndex) {
+                    EncounterEffect effect;
+                    input >> std::quoted(effect.description);
+                    if (!input || effect.description.empty()) {
+                        errorMessage = "invalid encounter effect";
+                        return false;
+                    }
+                    encounter.effects.push_back(std::move(effect));
+                }
+                std::size_t tableCount = 0;
+                if (!ReadSectionCount(input, "ENCOUNTER_TABLES", tableCount) || tableCount > 100) {
+                    errorMessage = "invalid ENCOUNTER_TABLES section";
+                    return false;
+                }
+                encounter.rollTables.reserve(tableCount);
+                for (std::size_t tableIndex = 0; tableIndex < tableCount; ++tableIndex) {
+                    EncounterRollTable table;
+                    std::size_t entryCount = 0;
+                    input >> table.dieSides >> entryCount >> std::quoted(table.name);
+                    if (!input || table.dieSides <= 0 || table.dieSides > 1000 ||
+                        entryCount == 0 || entryCount > 1000 || table.name.empty()) {
+                        errorMessage = "invalid encounter roll table";
+                        return false;
+                    }
+                    table.entries.reserve(entryCount);
+                    for (std::size_t entryIndex = 0; entryIndex < entryCount; ++entryIndex) {
+                        EncounterTableEntry entry;
+                        input >> entry.minimumRoll >> entry.maximumRoll >> std::quoted(entry.result);
+                        if (!input || entry.minimumRoll <= 0 ||
+                            entry.minimumRoll > entry.maximumRoll ||
+                            entry.maximumRoll > table.dieSides || entry.result.empty()) {
+                            errorMessage = "invalid encounter table row";
+                            return false;
+                        }
+                        table.entries.push_back(std::move(entry));
+                    }
+                    std::sort(table.entries.begin(), table.entries.end(),
+                              [](const EncounterTableEntry &left,
+                                 const EncounterTableEntry &right) {
+                                  return left.minimumRoll < right.minimumRoll;
+                              });
+                    for (std::size_t entryIndex = 1; entryIndex < table.entries.size();
+                         ++entryIndex) {
+                        if (table.entries[entryIndex].minimumRoll <=
+                            table.entries[entryIndex - 1].maximumRoll) {
+                            errorMessage = "encounter table roll ranges overlap";
+                            return false;
+                        }
+                    }
+                    encounter.rollTables.push_back(std::move(table));
+                }
+            }
+            if (loadedVersion >= 15) {
+                input >> tag >> std::quoted(encounter.sourceFile) >> std::quoted(encounter.trigger)
+                      >> std::quoted(encounter.objective) >> std::quoted(encounter.environment)
+                      >> std::quoted(encounter.gameMasterNotes) >> std::quoted(encounter.rewards)
+                      >> std::quoted(encounter.successOutcome) >> std::quoted(encounter.failureOutcome);
+                if (!input || tag != "ENCOUNTER_DETAILS") {
+                    errorMessage = "invalid ENCOUNTER_DETAILS section";
+                    return false;
+                }
+                std::size_t participantCount = 0;
+                input >> tag >> encounter.currentRound >> encounter.activeParticipant >> participantCount;
+                if (!input || tag != "ENCOUNTER_RUN" || encounter.currentRound < 0 ||
+                    participantCount > 10000 || encounter.activeParticipant < 0) {
+                    errorMessage = "invalid ENCOUNTER_RUN section";
+                    return false;
+                }
+                encounter.participants.reserve(participantCount);
+                for (std::size_t participantIndex = 0; participantIndex < participantCount;
+                     ++participantIndex) {
+                    EncounterParticipant participant;
+                    int defeated = 0;
+                    input >> participant.initiative >> participant.currentHitPoints >> defeated
+                          >> std::quoted(participant.name) >> std::quoted(participant.conditions);
+                    if (!input || participant.name.empty() ||
+                        (defeated != 0 && defeated != 1)) {
+                        errorMessage = "invalid encounter participant";
+                        return false;
+                    }
+                    participant.defeated = defeated != 0;
+                    encounter.participants.push_back(std::move(participant));
+                }
+                if (!encounter.participants.empty() &&
+                    encounter.activeParticipant >= static_cast<int>(encounter.participants.size())) {
+                    errorMessage = "encounter active participant is out of range";
+                    return false;
+                }
+            }
             loaded.encounters.push_back(std::move(encounter));
+        }
+    }
+
+    if (loadedVersion >= 12) {
+        std::size_t creatureCount = 0;
+        if (!ReadSectionCount(input, "CREATURES", creatureCount) || creatureCount > 10000) {
+            errorMessage = "invalid CREATURES section";
+            return false;
+        }
+        loaded.creatures.reserve(creatureCount);
+        for (std::size_t index = 0; index < creatureCount; ++index) {
+            CreatureStatBlock creature;
+            input >> std::quoted(creature.name) >> std::quoted(creature.classification)
+                  >> std::quoted(creature.armorClass) >> std::quoted(creature.hitPoints)
+                  >> std::quoted(creature.speed);
+            if (loadedVersion >= 14) {
+                for (int &score : creature.abilityScores) input >> score;
+            } else {
+                std::string legacyScores;
+                input >> std::quoted(legacyScores);
+                std::istringstream scores(legacyScores);
+                std::string label;
+                for (int &score : creature.abilityScores) {
+                    int parsed = 10;
+                    if (!(scores >> label >> parsed)) break;
+                    score = parsed;
+                }
+            }
+            input >> std::quoted(creature.savesAndSkills)
+                  >> std::quoted(creature.sensesAndLanguages) >> std::quoted(creature.challenge)
+                  >> std::quoted(creature.traits) >> std::quoted(creature.actions)
+                  >> std::quoted(creature.reactions) >> std::quoted(creature.legendaryActions);
+            if (!input || creature.name.empty()) {
+                errorMessage = "invalid creature stat block";
+                return false;
+            }
+            for (int score : creature.abilityScores) {
+                if (score < 0 || score > 99) {
+                    errorMessage = "invalid creature ability score";
+                    return false;
+                }
+            }
+            if (loadedVersion >= 13) {
+                std::size_t abilityCount = 0;
+                if (!ReadSectionCount(input, "CREATURE_ABILITIES", abilityCount) ||
+                    abilityCount > 1000) {
+                    errorMessage = "invalid CREATURE_ABILITIES section";
+                    return false;
+                }
+                creature.specialAbilities.reserve(abilityCount);
+                for (std::size_t abilityIndex = 0; abilityIndex < abilityCount; ++abilityIndex) {
+                    CreatureStatBlock::Ability ability;
+                    input >> std::quoted(ability.name) >> std::quoted(ability.description);
+                    if (!input || ability.name.empty()) {
+                        errorMessage = "invalid creature special ability";
+                        return false;
+                    }
+                    creature.specialAbilities.push_back(std::move(ability));
+                }
+            }
+            if (loadedVersion >= 15) {
+                input >> tag >> std::quoted(creature.damageVulnerabilities)
+                      >> std::quoted(creature.damageResistances)
+                      >> std::quoted(creature.damageImmunities)
+                      >> std::quoted(creature.conditionImmunities)
+                      >> std::quoted(creature.proficiencyBonus)
+                      >> std::quoted(creature.passivePerception)
+                      >> std::quoted(creature.spellcasting) >> std::quoted(creature.portraitFile);
+                if (!input || tag != "CREATURE_DETAILS") {
+                    errorMessage = "invalid CREATURE_DETAILS section";
+                    return false;
+                }
+            }
+            loaded.creatures.push_back(std::move(creature));
         }
     }
 
@@ -406,6 +660,31 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
                     }
                 }
             }
+            if (loadedVersion >= 15) {
+                std::size_t markerCount = 0;
+                if (!ReadSectionCount(input, "DUNGEON_MARKERS", markerCount) ||
+                    markerCount > 10000) {
+                    errorMessage = "invalid DUNGEON_MARKERS section";
+                    return false;
+                }
+                dungeon.markers.reserve(markerCount);
+                for (std::size_t markerIndex = 0; markerIndex < markerCount; ++markerIndex) {
+                    DungeonMarker marker;
+                    int kind = 0;
+                    int gameMasterOnly = 0;
+                    input >> marker.col >> marker.row >> kind >> gameMasterOnly
+                          >> std::quoted(marker.name) >> std::quoted(marker.description)
+                          >> std::quoted(marker.sourceFile);
+                    if (!input || kind < 0 || kind > static_cast<int>(DungeonMarkerKind::Note) ||
+                        (gameMasterOnly != 0 && gameMasterOnly != 1) || marker.name.empty()) {
+                        errorMessage = "invalid dungeon marker";
+                        return false;
+                    }
+                    marker.kind = static_cast<DungeonMarkerKind>(kind);
+                    marker.gameMasterOnly = gameMasterOnly != 0;
+                    dungeon.markers.push_back(std::move(marker));
+                }
+            }
             loaded.dungeons.push_back(std::move(dungeon));
         }
     }
@@ -448,6 +727,14 @@ bool LoadProjectDocument(const std::string &path, ProjectDocument &document,
 
     if (loaded.standaloneDungeon && loaded.dungeons.size() != 1) {
         errorMessage = "a standalone dungeon file must contain exactly one dungeon map";
+        return false;
+    }
+    if (loaded.standaloneEncounter && loaded.encounters.size() != 1) {
+        errorMessage = "a standalone encounter file must contain exactly one encounter";
+        return false;
+    }
+    if (loaded.standaloneCreature && loaded.creatures.size() != 1) {
+        errorMessage = "a standalone creature file must contain exactly one stat block";
         return false;
     }
 

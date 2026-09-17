@@ -2,7 +2,21 @@
 
 Map Drawer is a C++17/OpenGL map editor for tabletop campaigns. It provides square and hex
 overworld maps, configurable terrain, elevation, fog of war, settlements, points of interest,
-encounters, routes, and dungeon maps linked to Dungeon POIs.
+routes, and dungeon maps linked to Dungeon POIs. Its structured encounter builder supports
+noncombat events, optional creature groups, ordered effect chains, and one or more editable
+die-result tables with From, To, and Result columns.
+World maps, dungeon maps, encounters, and creature stat blocks can each be created as standalone
+files from the main menu. Encounter files can import saved creature files into their creature list.
+Encounters can also be placed on world maps. Creature stat blocks start with zero special abilities
+and can add any number of named abilities. Core STR, DEX, CON, INT, WIS, and CHA scores use
+separate labeled numeric boxes, so only their values need to be entered.
+
+Standalone encounters can be linked into world maps and dungeon tiles. The encounter runner keeps
+round, turn, hit-point, condition, and defeated-state information in the project file, while roll
+tables can be rolled directly from the builder. Dungeon maps support typed GM markers for rooms,
+encounters, traps, treasure, secrets, stairs, portals, and notes. Creature records also preserve
+defenses, proficiency, passive perception, spellcasting, and portrait/token references. The project
+sidebar provides Save As and the main menu can reopen the most recent file with Continue Last.
 
 ## Requirements
 

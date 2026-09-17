@@ -4,7 +4,9 @@
 // scroll wheel, and save/load the world as one versioned project file.
 #include "app_config.h"
 #include "app_types.h"
+#include "campaign_tools.h"
 #include "editor_commands.h"
+#include "encounter_builder.h"
 #include "editor_history.h"
 #include "editor_state.h"
 #include "logger.h"
@@ -84,6 +86,7 @@ void UpdateWindowTitle();
 void SelectTool(ToolMode mode);
 void SaveProjectNow();
 void RequestProjectSave();
+void RequestProjectSaveAs();
 bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback);
 bool RequestProjectLoad();
 void RequestClearActiveLayer();
@@ -94,6 +97,9 @@ void CheckForRecoveryAutosave();
 void GenerateTerrainRelief();
 void OpenKeybindHelp();
 void MarkProjectDirty();
+void StartStandaloneEncounter();
+void StartStandaloneCreature();
+void OpenModal(ModalType type, std::vector<std::string> fields);
 std::string ChooseProjectFileToOpen(const char *title);
 std::string ChooseProjectFileToSave(const char *title, const std::string &suggestedName);
 
@@ -146,6 +152,7 @@ int gSelectedDungeonPoiIndex = -1;
 int gEditingDungeonIndex = -1;
 int gDungeonBrush = static_cast<int>(DungeonTileKind::Floor);
 DungeonPlacementMode gDungeonPlacementMode = DungeonPlacementMode::None;
+DungeonMarkerKind gDungeonMarkerKind = DungeonMarkerKind::Note;
 bool gEditingDungeonTerrain = false;
 double gWorldCameraX = -kUiWidth;
 double gWorldCameraY = 0.0;
@@ -182,6 +189,24 @@ bool gUseUiTarget = false;
 uint64_t &gSceneRevision = gEditor.sceneRevision;
 bool gMainMenuOpen = true;
 bool gEditorSessionStarted = false;
+std::unordered_map<std::string, std::string> gEncounterCreatureSources;
+struct EncounterTableRowDraft {
+    std::string minimumRoll = "1";
+    std::string maximumRoll = "1";
+    std::string result;
+};
+struct EncounterTableDraft {
+    std::string name = "New Table";
+    std::string dieSides = "6";
+    std::vector<EncounterTableRowDraft> rows;
+};
+std::vector<EncounterTableDraft> gEncounterTableDrafts;
+int gEncounterActiveTable = 0;
+int gEncounterTableRowPage = 0;
+int gEncounterSelectedTableRow = -1;
+Encounter gEncounterWorkingDraft;
+std::string gEncounterRollResult;
+int gRunningEncounterIndex = -1;
 
 // Line tool: press-drag-release paints a thick line between two points.
 bool gLineDragging = false;
@@ -572,6 +597,36 @@ void PlaceDungeonSpecialAtCursor() {
     Dungeon *dungeon = ActiveDungeon();
     if (!dungeon || gDungeonPlacementMode == DungeonPlacementMode::None) return;
     auto [col, row] = DungeonCursorTile();
+    if (gDungeonPlacementMode == DungeonPlacementMode::Marker) {
+        gModalCol = col;
+        gModalRow = row;
+        gDungeonMarkerKind = DungeonMarkerKind::Note;
+        gDungeonPlacementMode = DungeonPlacementMode::None;
+        OpenModal(ModalType::DungeonMarker, {"", ""});
+        return;
+    }
+    if (gDungeonPlacementMode == DungeonPlacementMode::Encounter) {
+        std::string path = ChooseProjectFileToOpen("Select an encounter for this dungeon tile");
+        if (!path.empty()) {
+            ProjectDocument source;
+            int version = 0;
+            std::string error;
+            if (LoadProjectDocument(path, source, version, error) && source.standaloneEncounter &&
+                source.encounters.size() == 1) {
+                campaign_tools::AddDungeonMarker(
+                    *dungeon, {col, row, DungeonMarkerKind::Encounter,
+                               source.encounters.front().name,
+                               source.encounters.front().description, path, true});
+                MarkProjectDirty();
+                ++gSceneRevision;
+            } else {
+                LOG_ERROR("Could not add dungeon encounter: %s",
+                          error.empty() ? "not a standalone encounter" : error.c_str());
+            }
+        }
+        gDungeonPlacementMode = DungeonPlacementMode::None;
+        return;
+    }
     if (dungeon->tiles.count(TileKey(col, row)) == 0)
         dungeon->tiles[TileKey(col, row)] = static_cast<uint8_t>(std::max(1, gDungeonBrush));
     if (gDungeonPlacementMode == DungeonPlacementMode::Entrance) {
@@ -579,7 +634,7 @@ void PlaceDungeonSpecialAtCursor() {
         dungeon->entranceCol = col;
         dungeon->entranceRow = row;
         LOG_INFO("Dungeon entrance placed at (%d, %d)", col, row);
-    } else {
+    } else if (gDungeonPlacementMode == DungeonPlacementMode::Exit) {
         dungeon->hasExit = true;
         dungeon->exitCol = col;
         dungeon->exitRow = row;
@@ -1168,7 +1223,7 @@ void OpenKeybindHelp() {
         "V REGIONS   L LABELS   G GRID   Y HEX / SQUARE",
         "CLICK DUNGEON POI TO CREATE OR OPEN ITS DUNGEON MAP",
         "CTRL+F FIND   CTRL+E PLACE ENCOUNTER   I WORLD INFO",
-        "CLICK AN ENCOUNTER MARKER TO EDIT ITS DETAILS",
+        "ENCOUNTERS CAN ALSO BE CREATED AS STANDALONE FILES FROM THE MAIN MENU",
         "DELETE MARKER/SELECTION   X DELETE ROUTE",
         "CTRL+C/X/V COPY / CUT / PASTE SELECTION",
         "CTRL+Z/Y UNDO / REDO   C CLEAR ACTIVE LAYER",
@@ -1262,20 +1317,383 @@ void PlacePoiAtCursor() {
     OpenModal(ModalType::Poi, {"", ""});
 }
 
+void LoadEncounterTableDrafts(const Encounter &encounter) {
+    gEncounterTableDrafts.clear();
+    for (const EncounterRollTable &table : encounter.rollTables) {
+        EncounterTableDraft draft;
+        draft.name = table.name;
+        draft.dieSides = std::to_string(table.dieSides);
+        draft.rows.clear();
+        for (const EncounterTableEntry &entry : table.entries)
+            draft.rows.push_back({std::to_string(entry.minimumRoll),
+                                  std::to_string(entry.maximumRoll), entry.result});
+        gEncounterTableDrafts.push_back(std::move(draft));
+    }
+    gEncounterActiveTable = 0;
+    gEncounterTableRowPage = 0;
+    gEncounterSelectedTableRow = -1;
+}
+
+std::string *EncounterModalText(int field) {
+    if (field >= 0 && field < static_cast<int>(gModalFields.size()))
+        return &gModalFields[static_cast<size_t>(field)];
+    if (gEncounterTableDrafts.empty() || gEncounterActiveTable < 0 ||
+        gEncounterActiveTable >= static_cast<int>(gEncounterTableDrafts.size()))
+        return nullptr;
+    EncounterTableDraft &table = gEncounterTableDrafts[static_cast<size_t>(gEncounterActiveTable)];
+    if (field == 100) return &table.name;
+    if (field == 101) return &table.dieSides;
+    if (field < 200) return nullptr;
+    int encoded = field - 200;
+    int row = encoded / 3;
+    int column = encoded % 3;
+    if (row < 0 || row >= static_cast<int>(table.rows.size())) return nullptr;
+    EncounterTableRowDraft &draft = table.rows[static_cast<size_t>(row)];
+    if (column == 0) return &draft.minimumRoll;
+    if (column == 1) return &draft.maximumRoll;
+    return &draft.result;
+}
+
+std::vector<int> EncounterEditableFields() {
+    std::vector<int> fields;
+    for (int index = 0; index < static_cast<int>(gModalFields.size()); ++index)
+        fields.push_back(index);
+    if (gEncounterTableDrafts.empty() || gEncounterActiveTable < 0 ||
+        gEncounterActiveTable >= static_cast<int>(gEncounterTableDrafts.size()))
+        return fields;
+    fields.push_back(100);
+    fields.push_back(101);
+    const EncounterTableDraft &table =
+        gEncounterTableDrafts[static_cast<size_t>(gEncounterActiveTable)];
+    constexpr int rowsPerPage = 5;
+    int firstRow = gEncounterTableRowPage * rowsPerPage;
+    int lastRow = std::min(firstRow + rowsPerPage, static_cast<int>(table.rows.size()));
+    for (int row = firstRow; row < lastRow; ++row)
+        for (int column = 0; column < 3; ++column)
+            fields.push_back(200 + row * 3 + column);
+    return fields;
+}
+
+bool BuildEncounterTablesFromDrafts(Encounter &encounter, std::string &error) {
+    encounter.rollTables.clear();
+    auto parseNumber = [](const std::string &text, int &value) {
+        if (text.empty() || !std::all_of(text.begin(), text.end(), [](unsigned char c) {
+                return std::isdigit(c) != 0;
+            }))
+            return false;
+        try { value = std::stoi(text); } catch (...) { return false; }
+        return value > 0;
+    };
+    for (const EncounterTableDraft &draft : gEncounterTableDrafts) {
+        EncounterRollTable table;
+        table.name = draft.name;
+        if (table.name.empty() || !parseNumber(draft.dieSides, table.dieSides) ||
+            table.dieSides > 1000) {
+            error = "EACH TABLE NEEDS A NAME AND A VALID DIE SIZE";
+            return false;
+        }
+        if (draft.rows.empty()) {
+            error = "EACH TABLE NEEDS AT LEAST ONE ROW";
+            return false;
+        }
+        for (const EncounterTableRowDraft &row : draft.rows) {
+            EncounterTableEntry entry;
+            if (!parseNumber(row.minimumRoll, entry.minimumRoll) ||
+                !parseNumber(row.maximumRoll, entry.maximumRoll) ||
+                entry.minimumRoll > entry.maximumRoll || entry.maximumRoll > table.dieSides ||
+                row.result.empty()) {
+                error = "TABLE ROWS NEED VALID RANGES AND RESULTS";
+                return false;
+            }
+            entry.result = row.result;
+            table.entries.push_back(std::move(entry));
+        }
+        std::sort(table.entries.begin(), table.entries.end(), [](const auto &left, const auto &right) {
+            return left.minimumRoll < right.minimumRoll;
+        });
+        for (size_t index = 1; index < table.entries.size(); ++index) {
+            if (table.entries[index].minimumRoll <= table.entries[index - 1].maximumRoll) {
+                error = "TABLE ROLL RANGES CANNOT OVERLAP";
+                return false;
+            }
+        }
+        encounter.rollTables.push_back(std::move(table));
+    }
+    return true;
+}
+
 // Opens an in-window form for a persistent DM encounter at the cursor.
 void PlaceEncounterAtCursor() {
     std::tie(gModalCol, gModalRow) = CursorTile();
     gEditingEncounterIndex = -1;
-    OpenModal(ModalType::Encounter, {"", ""});
+    gEncounterCreatureSources.clear();
+    gEncounterWorkingDraft = Encounter{};
+    LoadEncounterTableDrafts(Encounter{});
+    OpenModal(ModalType::Encounter, {"", "", "", "", "", "", "", "", "", "", "", ""});
 }
 
 void EditEncounter(size_t index) {
     if (index >= gEncounters.size()) return;
     const Encounter &encounter = gEncounters[index];
+    gEncounterWorkingDraft = encounter;
     gModalCol = encounter.col;
     gModalRow = encounter.row;
     gEditingEncounterIndex = static_cast<int>(index);
-    OpenModal(ModalType::Encounter, {encounter.name, encounter.description});
+    gEncounterCreatureSources.clear();
+    for (const EncounterCreature &creature : encounter.creatures)
+        if (!creature.sourceFile.empty())
+            gEncounterCreatureSources[creature.name] = creature.sourceFile;
+    LoadEncounterTableDrafts(encounter);
+    OpenModal(ModalType::Encounter,
+              {encounter.name, encounter.description, FormatEncounterCreatures(encounter),
+               FormatEncounterEffects(encounter), encounter.trigger, encounter.objective,
+               encounter.environment, encounter.gameMasterNotes, encounter.rewards,
+               encounter.successOutcome, encounter.failureOutcome, encounter.sourceFile});
+}
+
+void StartStandaloneEncounter() {
+    gProjectDocument = ProjectDocument{};
+    gProjectDocument.standaloneEncounter = true;
+    Encounter encounter;
+    encounter.name = "Untitled Encounter";
+    gEncounters.push_back(std::move(encounter));
+    gProjectFile.clear();
+    gEditor.ResetForLoadedDocument();
+    gEditorTab = EditorTab::World;
+    gActiveDungeonIndex = -1;
+    gPlacementMode = PlacementMode::None;
+    MarkProjectDirty();
+    EditEncounter(0);
+    LOG_INFO("Created a new standalone encounter");
+}
+
+std::string FormatCreatureSpecialAbilities(const CreatureStatBlock &creature) {
+    std::string text;
+    for (const CreatureStatBlock::Ability &ability : creature.specialAbilities) {
+        if (!text.empty()) text += "; ";
+        text += ability.name + "=" + ability.description;
+    }
+    return text;
+}
+
+bool ParseCreatureSpecialAbilities(const std::string &text, CreatureStatBlock &creature,
+                                   std::string &error) {
+    creature.specialAbilities.clear();
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find(';', start);
+        std::string entry = text.substr(start, end == std::string::npos ? end : end - start);
+        auto trim = [](std::string value) {
+            size_t first = value.find_first_not_of(" \t");
+            if (first == std::string::npos) return std::string{};
+            size_t last = value.find_last_not_of(" \t");
+            return value.substr(first, last - first + 1);
+        };
+        entry = trim(entry);
+        if (!entry.empty()) {
+            size_t equals = entry.find('=');
+            CreatureStatBlock::Ability ability;
+            if (equals == std::string::npos ||
+                (ability.name = trim(entry.substr(0, equals))).empty() ||
+                (ability.description = trim(entry.substr(equals + 1))).empty()) {
+                error = "ABILITIES USE: NAME=DESCRIPTION; NAME=DESCRIPTION";
+                return false;
+            }
+            creature.specialAbilities.push_back(std::move(ability));
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return true;
+}
+
+std::vector<std::string> CreatureBuilderFields(const CreatureStatBlock &creature) {
+    std::vector<std::string> fields{creature.name, creature.classification,
+                                    creature.armorClass, creature.hitPoints, creature.speed};
+    for (int score : creature.abilityScores) fields.push_back(std::to_string(score));
+    fields.insert(fields.end(), {creature.savesAndSkills, creature.sensesAndLanguages,
+                                  creature.challenge, creature.traits,
+                                  FormatCreatureSpecialAbilities(creature), creature.actions,
+                                  creature.reactions, creature.legendaryActions,
+                                  creature.damageVulnerabilities, creature.damageResistances,
+                                  creature.damageImmunities, creature.conditionImmunities,
+                                  creature.proficiencyBonus, creature.passivePerception,
+                                  creature.spellcasting, creature.portraitFile});
+    return fields;
+}
+
+void OpenCreatureBuilder() {
+    if (gProjectDocument.creatures.empty()) return;
+    OpenModal(ModalType::CreatureBuilder,
+              CreatureBuilderFields(gProjectDocument.creatures.front()));
+}
+
+void StartStandaloneCreature() {
+    gProjectDocument = ProjectDocument{};
+    gProjectDocument.standaloneCreature = true;
+    CreatureStatBlock creature;
+    creature.name = "Untitled Creature";
+    creature.classification = "Medium creature, unaligned";
+    creature.armorClass = "10";
+    creature.hitPoints = "1 (1d8-3)";
+    creature.speed = "30 ft.";
+    creature.challenge = "0";
+    gProjectDocument.creatures.push_back(std::move(creature));
+    gProjectFile.clear();
+    gEditor.ResetForLoadedDocument();
+    gEditorTab = EditorTab::World;
+    gPlacementMode = PlacementMode::None;
+    MarkProjectDirty();
+    OpenCreatureBuilder();
+    LOG_INFO("Created a new standalone creature stat block");
+}
+
+void AddCreatureFileToEncounter() {
+    std::string path = ChooseProjectFileToOpen("Select a creature stat block");
+    if (path.empty()) return;
+    ProjectDocument source;
+    int version = 0;
+    std::string error;
+    if (!LoadProjectDocument(path, source, version, error) || !source.standaloneCreature ||
+        source.creatures.size() != 1) {
+        gModalError = error.empty() ? "SELECT A STANDALONE CREATURE FILE" : error;
+        return;
+    }
+    const std::string &name = source.creatures.front().name;
+    if (!gModalFields[2].empty()) gModalFields[2] += "; ";
+    gModalFields[2] += "1 " + name;
+    gEncounterCreatureSources[name] = path;
+    gModalError.clear();
+}
+
+void LoadEncounterFileIntoBuilder() {
+    if (gModalType != ModalType::Encounter) return;
+    std::string path = ChooseProjectFileToOpen("Select an encounter file");
+    if (path.empty()) return;
+    ProjectDocument source;
+    int version = 0;
+    std::string error;
+    if (!LoadProjectDocument(path, source, version, error) || !source.standaloneEncounter ||
+        source.encounters.size() != 1) {
+        gModalError = error.empty() ? "SELECT A STANDALONE ENCOUNTER FILE" : error;
+        return;
+    }
+    gEncounterWorkingDraft = source.encounters.front();
+    gEncounterWorkingDraft.sourceFile = path;
+    gModalFields = {gEncounterWorkingDraft.name, gEncounterWorkingDraft.description,
+                    FormatEncounterCreatures(gEncounterWorkingDraft),
+                    FormatEncounterEffects(gEncounterWorkingDraft), gEncounterWorkingDraft.trigger,
+                    gEncounterWorkingDraft.objective, gEncounterWorkingDraft.environment,
+                    gEncounterWorkingDraft.gameMasterNotes, gEncounterWorkingDraft.rewards,
+                    gEncounterWorkingDraft.successOutcome, gEncounterWorkingDraft.failureOutcome,
+                    gEncounterWorkingDraft.sourceFile};
+    gEncounterCreatureSources.clear();
+    for (const EncounterCreature &creature : gEncounterWorkingDraft.creatures)
+        if (!creature.sourceFile.empty())
+            gEncounterCreatureSources[creature.name] = creature.sourceFile;
+    LoadEncounterTableDrafts(gEncounterWorkingDraft);
+    gModalField = 0;
+    gModalError.clear();
+    LOG_INFO("Loaded encounter template from %s", path.c_str());
+}
+
+void RollActiveEncounterTable() {
+    gEncounterRollResult.clear();
+    if (gEncounterTableDrafts.empty()) return;
+    Encounter preview;
+    std::string error;
+    if (!BuildEncounterTablesFromDrafts(preview, error)) {
+        gModalError = error;
+        return;
+    }
+    const EncounterRollTable &table =
+        preview.rollTables[static_cast<size_t>(gEncounterActiveTable)];
+    int roll = 1 + std::rand() % table.dieSides;
+    std::string result = "NO MATCHING RESULT";
+    if (const EncounterTableEntry *entry = campaign_tools::ResolveRoll(table, roll))
+        result = entry->result;
+    gEncounterRollResult = "ROLLED " + std::to_string(roll) + ": " + result;
+    gModalError.clear();
+}
+
+void StartEncounterRunner() {
+    if (gModalType != ModalType::Encounter || gModalFields.size() != 12) return;
+    Encounter encounter = gEncounterWorkingDraft;
+    encounter.col = gModalCol;
+    encounter.row = gModalRow;
+    encounter.name = gModalFields[0].empty() ? "Encounter" : gModalFields[0];
+    encounter.description = gModalFields[1];
+    encounter.trigger = gModalFields[4];
+    encounter.objective = gModalFields[5];
+    encounter.environment = gModalFields[6];
+    encounter.gameMasterNotes = gModalFields[7];
+    encounter.rewards = gModalFields[8];
+    encounter.successOutcome = gModalFields[9];
+    encounter.failureOutcome = gModalFields[10];
+    encounter.sourceFile = gModalFields[11];
+    if (!ParseEncounterBuilderFields(gModalFields[2], gModalFields[3], "", encounter,
+                                     gModalError) ||
+        !BuildEncounterTablesFromDrafts(encounter, gModalError))
+        return;
+    for (EncounterCreature &creature : encounter.creatures) {
+        auto source = gEncounterCreatureSources.find(creature.name);
+        if (source != gEncounterCreatureSources.end()) creature.sourceFile = source->second;
+    }
+    if (encounter.participants.empty()) {
+        for (const EncounterCreature &group : encounter.creatures) {
+            for (int number = 1; number <= group.count; ++number) {
+                EncounterParticipant participant;
+                participant.name = group.name;
+                participant.initiative = 1 + std::rand() % 20;
+                if (group.count > 1) participant.name += " " + std::to_string(number);
+                if (!group.sourceFile.empty()) {
+                    ProjectDocument creatureDocument;
+                    int version = 0;
+                    std::string error;
+                    if (LoadProjectDocument(group.sourceFile, creatureDocument, version, error) &&
+                        creatureDocument.standaloneCreature && !creatureDocument.creatures.empty()) {
+                        const std::string &hp = creatureDocument.creatures.front().hitPoints;
+                        try { participant.currentHitPoints = std::stoi(hp); } catch (...) {}
+                    }
+                }
+                encounter.participants.push_back(std::move(participant));
+            }
+        }
+    }
+    if (encounter.currentRound == 0) encounter.currentRound = 1;
+    if (gEditingEncounterIndex >= 0 &&
+        gEditingEncounterIndex < static_cast<int>(gEncounters.size())) {
+        gEncounters[static_cast<size_t>(gEditingEncounterIndex)] = std::move(encounter);
+        gRunningEncounterIndex = gEditingEncounterIndex;
+    } else {
+        gEncounters.push_back(std::move(encounter));
+        gRunningEncounterIndex = static_cast<int>(gEncounters.size()) - 1;
+        gEditingEncounterIndex = gRunningEncounterIndex;
+    }
+    MarkProjectDirty();
+    gModalType = ModalType::EncounterRunner;
+    gModalError.clear();
+}
+
+void AppendCreatureAbilityTemplate() {
+    if (gModalType != ModalType::CreatureBuilder || gModalFields.size() != 27) return;
+    if (!gModalFields[15].empty()) gModalFields[15] += "; ";
+    gModalFields[15] += "New Ability=Describe what this ability does";
+    gModalField = 15;
+}
+
+void RemoveLastCreatureAbility() {
+    if (gModalType != ModalType::CreatureBuilder || gModalFields.size() != 27) return;
+    CreatureStatBlock creature;
+    std::string error;
+    if (!ParseCreatureSpecialAbilities(gModalFields[15], creature, error) ||
+        creature.specialAbilities.empty()) {
+        gModalError = creature.specialAbilities.empty() ? "NO ABILITY TO REMOVE" : error;
+        return;
+    }
+    creature.specialAbilities.pop_back();
+    gModalFields[15] = FormatCreatureSpecialAbilities(creature);
+    gModalError.clear();
 }
 
 bool ShowMarkerInfoAtTile(int32_t col, int32_t row) {
@@ -1406,6 +1824,8 @@ void RunWorldSearch(const std::string &query) {
 
 void CloseModal(bool accept) {
     if (gModalType == ModalType::None) return;
+    const bool standaloneEncounterBuilder =
+        gModalType == ModalType::Encounter && gProjectDocument.standaloneEncounter;
     if (gModalType == ModalType::Confirm) {
         ConfirmAction action = gConfirmAction;
         gModalType = ModalType::None;
@@ -1423,6 +1843,10 @@ void CloseModal(bool accept) {
             }
             else if (action == ConfirmAction::OverwriteProject) SaveProjectNow();
             else if (action == ConfirmAction::GenerateRelief) GenerateTerrainRelief();
+            else if (action == ConfirmAction::ReturnMainMenu) {
+                gProjectDirty = false;
+                gMainMenuOpen = true;
+            }
             else if (action == ConfirmAction::RecoverAutosave) {
                 if (LoadProjectFromPath(kAutosaveFile, false)) {
                     gProjectDirty = true;
@@ -1458,6 +1882,18 @@ void CloseModal(bool accept) {
         gModalType = ModalType::None;
         gModalFields.clear();
         if (accept) RunWorldSearch(query);
+        UpdateWindowTitle();
+        return;
+    }
+    if (gModalType == ModalType::EncounterRunner) {
+        int index = gRunningEncounterIndex;
+        gRunningEncounterIndex = -1;
+        if (index >= 0 && index < static_cast<int>(gEncounters.size())) {
+            MarkProjectDirty();
+            EditEncounter(static_cast<size_t>(index));
+        } else {
+            gModalType = ModalType::None;
+        }
         UpdateWindowTitle();
         return;
     }
@@ -1510,6 +1946,81 @@ void CloseModal(bool accept) {
         MarkProjectDirty();
         if (creating) OpenDungeonTab(dungeonIndex);
         else UpdateWindowTitle();
+        return;
+    }
+    if (gModalType == ModalType::DungeonMarker) {
+        if (accept && gModalFields.size() == 2 && !gModalFields[0].empty()) {
+            Dungeon *dungeon = ActiveDungeon();
+            if (dungeon) {
+                campaign_tools::AddDungeonMarker(
+                    *dungeon, {gModalCol, gModalRow, gDungeonMarkerKind,
+                               gModalFields[0], gModalFields[1], "", true});
+                MarkProjectDirty();
+                ++gSceneRevision;
+            }
+        }
+        gModalType = ModalType::None;
+        gModalFields.clear();
+        gModalError.clear();
+        UpdateWindowTitle();
+        return;
+    }
+    if (gModalType == ModalType::CreatureBuilder) {
+        if (!accept) {
+            gModalType = ModalType::None;
+            gModalFields.clear();
+            gMainMenuOpen = true;
+            UpdateWindowTitle();
+            return;
+        }
+        if (gModalFields.size() != 27 || gModalFields[0].empty()) {
+            gModalError = "A CREATURE NAME IS REQUIRED";
+            return;
+        }
+        CreatureStatBlock creature;
+        creature.name = gModalFields[0];
+        creature.classification = gModalFields[1];
+        creature.armorClass = gModalFields[2];
+        creature.hitPoints = gModalFields[3];
+        creature.speed = gModalFields[4];
+        for (size_t scoreIndex = 0; scoreIndex < creature.abilityScores.size(); ++scoreIndex) {
+            const std::string &text = gModalFields[5 + scoreIndex];
+            if (text.empty() || !std::all_of(text.begin(), text.end(), [](unsigned char c) {
+                    return std::isdigit(c) != 0;
+                })) {
+                gModalError = "ABILITY SCORES MUST BE NUMBERS FROM 0 TO 99";
+                return;
+            }
+            int score = std::stoi(text);
+            if (score < 0 || score > 99) {
+                gModalError = "ABILITY SCORES MUST BE NUMBERS FROM 0 TO 99";
+                return;
+            }
+            creature.abilityScores[scoreIndex] = score;
+        }
+        creature.savesAndSkills = gModalFields[11];
+        creature.sensesAndLanguages = gModalFields[12];
+        creature.challenge = gModalFields[13];
+        creature.traits = gModalFields[14];
+        if (!ParseCreatureSpecialAbilities(gModalFields[15], creature, gModalError)) return;
+        creature.actions = gModalFields[16];
+        creature.reactions = gModalFields[17];
+        creature.legendaryActions = gModalFields[18];
+        creature.damageVulnerabilities = gModalFields[19];
+        creature.damageResistances = gModalFields[20];
+        creature.damageImmunities = gModalFields[21];
+        creature.conditionImmunities = gModalFields[22];
+        creature.proficiencyBonus = gModalFields[23];
+        creature.passivePerception = gModalFields[24];
+        creature.spellcasting = gModalFields[25];
+        creature.portraitFile = gModalFields[26];
+        gProjectDocument.creatures.front() = std::move(creature);
+        gModalType = ModalType::None;
+        gModalFields.clear();
+        MarkProjectDirty();
+        SaveProjectNow();
+        gMainMenuOpen = true;
+        UpdateWindowTitle();
         return;
     }
     if (gModalType == ModalType::TerrainEditor) {
@@ -1593,11 +2104,28 @@ void CloseModal(bool accept) {
                 openDungeonManager = true;
             }
         } else if (gModalType == ModalType::Encounter) {
-            Encounter encounter;
+            if (gModalFields.size() != 12) return;
+            Encounter encounter = gEncounterWorkingDraft;
             encounter.col = gModalCol;
             encounter.row = gModalRow;
             encounter.name = gModalFields[0].empty() ? "Encounter" : gModalFields[0];
             encounter.description = gModalFields[1];
+            encounter.trigger = gModalFields[4];
+            encounter.objective = gModalFields[5];
+            encounter.environment = gModalFields[6];
+            encounter.gameMasterNotes = gModalFields[7];
+            encounter.rewards = gModalFields[8];
+            encounter.successOutcome = gModalFields[9];
+            encounter.failureOutcome = gModalFields[10];
+            encounter.sourceFile = gModalFields[11];
+            if (!ParseEncounterBuilderFields(gModalFields[2], gModalFields[3], "",
+                                             encounter, gModalError) ||
+                !BuildEncounterTablesFromDrafts(encounter, gModalError))
+                return;
+            for (EncounterCreature &creature : encounter.creatures) {
+                auto source = gEncounterCreatureSources.find(creature.name);
+                if (source != gEncounterCreatureSources.end()) creature.sourceFile = source->second;
+            }
             if (gEditingEncounterIndex >= 0 &&
                 gEditingEncounterIndex < static_cast<int>(gEncounters.size())) {
                 gEncounters[static_cast<size_t>(gEditingEncounterIndex)] = std::move(encounter);
@@ -1625,11 +2153,16 @@ void CloseModal(bool accept) {
     }
     gModalType = ModalType::None;
     gModalFields.clear();
+    gEncounterTableDrafts.clear();
     gModalError.clear();
     gInfoTitle.clear();
     gInfoLines.clear();
     gModalField = 0;
     gEditingEncounterIndex = -1;
+    if (standaloneEncounterBuilder) {
+        if (accept) SaveProjectNow();
+        gMainMenuOpen = true;
+    }
     if (openDungeonManager) OpenDungeonManagerForPoi(gSelectedDungeonPoiIndex);
     else UpdateWindowTitle();
 }
@@ -1794,6 +2327,23 @@ void ExportScreenshot() {
 void UpdateWindowTitle() {
     if (gMainMenuOpen) {
         glfwSetWindowTitle(gWindow, "DND Map Drawer - Main Menu");
+        return;
+    }
+    if (gProjectDocument.standaloneEncounter) {
+        const char *name = gEncounters.empty() ? "Untitled Encounter"
+                                                : gEncounters.front().name.c_str();
+        std::string title = std::string("DND Map Drawer") +
+                            (gProjectDirty ? " * - Encounter: " : " - Encounter: ") + name;
+        glfwSetWindowTitle(gWindow, title.c_str());
+        return;
+    }
+    if (gProjectDocument.standaloneCreature) {
+        const char *name = gProjectDocument.creatures.empty()
+                               ? "Untitled Creature"
+                               : gProjectDocument.creatures.front().name.c_str();
+        std::string title = std::string("DND Map Drawer") +
+                            (gProjectDirty ? " * - Creature: " : " - Creature: ") + name;
+        glfwSetWindowTitle(gWindow, title.c_str());
         return;
     }
     if (gEditorTab == EditorTab::Dungeon) {
@@ -2123,12 +2673,36 @@ bool SaveLinkedDungeonFiles() {
     return allSaved;
 }
 
+bool SaveLinkedEncounterFiles() {
+    if (gProjectDocument.standaloneEncounter) return true;
+    bool allSaved = true;
+    for (const Encounter &encounter : gEncounters) {
+        if (encounter.sourceFile.empty()) continue;
+        ProjectDocument standalone;
+        standalone.standaloneEncounter = true;
+        Encounter copy = encounter;
+        copy.sourceFile.clear();
+        standalone.encounters.push_back(std::move(copy));
+        std::string error;
+        if (!SaveProjectDocument(encounter.sourceFile, standalone, error)) {
+            LOG_ERROR("Could not update linked encounter %s: %s",
+                      encounter.sourceFile.c_str(), error.c_str());
+            allSaved = false;
+        }
+    }
+    return allSaved;
+}
+
 void SaveProjectNow() {
     namespace fs = std::filesystem;
     if (gProjectFile.empty()) {
         gProjectFile = ChooseProjectFileToSave(
-            gProjectDocument.standaloneDungeon ? "Save dungeon map" : "Save world map",
-            gProjectDocument.standaloneDungeon ? "dungeon_map.txt" : "world_map.txt");
+            gProjectDocument.standaloneDungeon ? "Save dungeon map" :
+            gProjectDocument.standaloneEncounter ? "Save encounter" :
+            gProjectDocument.standaloneCreature ? "Save creature" : "Save world map",
+            gProjectDocument.standaloneDungeon ? "dungeon_map.txt" :
+            gProjectDocument.standaloneEncounter ? "encounter.txt" :
+            gProjectDocument.standaloneCreature ? "creature.txt" : "world_map.txt");
         if (gProjectFile.empty()) return;
         SaveProjectConfig();
     }
@@ -2153,7 +2727,9 @@ void SaveProjectNow() {
         else LOG_INFO("Backup created: %s", backup.string().c_str());
     }
     bool linkedDungeonsSaved = SaveLinkedDungeonFiles();
-    if (SaveProjectToPath(gProjectFile, true) && linkedDungeonsSaved) gProjectDirty = false;
+    bool linkedEncountersSaved = SaveLinkedEncounterFiles();
+    if (SaveProjectToPath(gProjectFile, true) && linkedDungeonsSaved && linkedEncountersSaved)
+        gProjectDirty = false;
 }
 
 void RequestProjectSave() {
@@ -2189,6 +2765,71 @@ void LoadProjectConfig() {
         return;
     }
     gProjectFile = candidate.string();
+}
+
+void RequestProjectSaveAs() {
+    std::string suggested = gProjectFile.empty()
+                                ? (gProjectDocument.standaloneDungeon ? "dungeon_map.txt" :
+                                   gProjectDocument.standaloneEncounter ? "encounter.txt" :
+                                   gProjectDocument.standaloneCreature ? "creature.txt" :
+                                   "world_map.txt")
+                                : std::filesystem::path(gProjectFile).filename().string();
+    std::string path = ChooseProjectFileToSave("Save a copy as", suggested);
+    if (path.empty()) return;
+    gProjectFile = path;
+    SaveProjectConfig();
+    SaveProjectNow();
+}
+
+void ReturnToMainMenu() {
+    if (gProjectDirty) {
+        OpenConfirmation(ConfirmAction::ReturnMainMenu, "RETURN TO MAIN MENU",
+                         {"DISCARD UNSAVED CHANGES?", "USE SAVE OR SAVE AS FIRST TO KEEP THEM"});
+        return;
+    }
+    gModalType = ModalType::None;
+    gMainMenuOpen = true;
+}
+
+void ExportTextSheet() {
+    std::string path = ChooseProjectFileToSave("Export printable reference", "reference_sheet.txt");
+    if (path.empty()) return;
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) return;
+    if (gProjectDocument.standaloneCreature && !gProjectDocument.creatures.empty()) {
+        const CreatureStatBlock &c = gProjectDocument.creatures.front();
+        out << c.name << "\n" << c.classification << "\nAC " << c.armorClass << "  HP "
+            << c.hitPoints << "  SPEED " << c.speed << "\n";
+        static const char *names[] = {"STR", "DEX", "CON", "INT", "WIS", "CHA"};
+        for (int i = 0; i < 6; ++i) {
+            int modifier = campaign_tools::AbilityModifier(c.abilityScores[i]);
+            out << names[i] << ' ' << c.abilityScores[i] << " (" << (modifier >= 0 ? "+" : "")
+                << modifier << ")  ";
+        }
+        out << "\nTRAITS " << c.traits << "\n";
+        for (const auto &ability : c.specialAbilities)
+            out << ability.name << ". " << ability.description << "\n";
+        out << "ACTIONS " << c.actions << "\nREACTIONS " << c.reactions
+            << "\nLEGENDARY ACTIONS " << c.legendaryActions << "\n";
+    } else if (gProjectDocument.standaloneEncounter && !gEncounters.empty()) {
+        const Encounter &e = gEncounters.front();
+        out << e.name << "\n" << e.description << "\nTRIGGER " << e.trigger
+            << "\nOBJECTIVE " << e.objective << "\nREWARDS " << e.rewards << "\n";
+        for (const EncounterCreature &creature : e.creatures)
+            out << creature.count << " x " << creature.name << "\n";
+        for (size_t i = 0; i < e.effects.size(); ++i)
+            out << "STEP " << i + 1 << ": " << e.effects[i].description << "\n";
+        for (const EncounterRollTable &table : e.rollTables) {
+            out << "\n" << table.name << " (d" << table.dieSides << ")\n";
+            for (const auto &row : table.entries)
+                out << row.minimumRoll << '-' << row.maximumRoll << "  " << row.result << "\n";
+        }
+    } else {
+        out << "MAP DRAWER REFERENCE\nCities: " << gCities.size() << "\nPoints of interest: "
+            << gPois.size() << "\nEncounters: " << gEncounters.size() << "\nDungeons: "
+            << gDungeons.size() << "\n";
+    }
+    LOG_INFO("Reference sheet exported to %s", path.c_str());
 }
 
 bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
@@ -2273,6 +2914,9 @@ bool LoadProjectFromPath(const std::string &path, bool allowLegacyFallback) {
     LOG_INFO("Project loaded from %s (version %d, %zu terrain tiles, %zu elevation tiles)",
              path.c_str(), version, gMapData.size(), gElevationData.size());
     if (gProjectDocument.standaloneDungeon && !gDungeons.empty()) OpenDungeonTab(0);
+    else if (gProjectDocument.standaloneEncounter && !gEncounters.empty()) EditEncounter(0);
+    else if (gProjectDocument.standaloneCreature && !gProjectDocument.creatures.empty())
+        OpenCreatureBuilder();
     else UpdateWindowTitle();
     return true;
 }
@@ -2578,7 +3222,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
         const float width = static_cast<float>(gWindowWidth);
         const float height = static_cast<float>(gWindowHeight);
         const float cardWidth = std::min(580.0f, width - 80.0f);
-        const float cardHeight = 600.0f;
+        const float cardHeight = 640.0f;
         const float cardX = (width - cardWidth) * 0.5f;
         const float cardY = std::max(40.0f, (height - cardHeight) * 0.5f);
 
@@ -2597,31 +3241,39 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
 
         auto addTask = [&](float y, const char *number, const char *title,
                            const char *description, UiAction action, const Vec3 &accent) {
-            AppendUiRect(vertices, cardX + 38.0f, y, cardWidth - 76.0f, 102.0f,
+            AppendUiRect(vertices, cardX + 38.0f, y, cardWidth - 76.0f, 70.0f,
                          {0.105f, 0.125f, 0.155f});
-            AppendUiRect(vertices, cardX + 38.0f, y, 7.0f, 102.0f, accent);
-            AppendUiText(vertices, number, cardX + 62.0f, y + 25.0f, 2.8f, accent, 2);
-            AppendUiText(vertices, title, cardX + 112.0f, y + 20.0f, 2.25f,
+            AppendUiRect(vertices, cardX + 38.0f, y, 7.0f, 70.0f, accent);
+            AppendUiText(vertices, number, cardX + 62.0f, y + 16.0f, 2.6f, accent, 2);
+            AppendUiText(vertices, title, cardX + 112.0f, y + 11.0f, 2.1f,
                          {0.94f, 0.95f, 0.97f}, 34);
-            AppendUiText(vertices, description, cardX + 112.0f, y + 58.0f, 1.35f,
+            AppendUiText(vertices, description, cardX + 112.0f, y + 40.0f, 1.25f,
                          {0.65f, 0.70f, 0.78f}, 58);
-            gUiHits.push_back({cardX + 38.0f, y, cardWidth - 76.0f, 102.0f, action, 0});
+            gUiHits.push_back({cardX + 38.0f, y, cardWidth - 76.0f, 70.0f, action, 0});
         };
 
-        addTask(cardY + 132.0f, "1", "WORLD MAP",
+        addTask(cardY + 112.0f, "1", "WORLD MAP",
                 "TERRAIN, REGIONS, ROUTES AND LOCATIONS", UiAction::MainWorld,
                 {0.32f, 0.72f, 0.48f});
-        addTask(cardY + 248.0f, "2", "DUNGEON MAP",
+        addTask(cardY + 190.0f, "2", "DUNGEON MAP",
                 "GO STRAIGHT TO A STANDALONE DUNGEON", UiAction::MainDungeon,
                 {0.88f, 0.38f, 0.20f});
-        addTask(cardY + 364.0f, "3", "LOAD MAP",
-                "CHOOSE ANY SAVED WORLD OR DUNGEON FILE", UiAction::MainLoad,
+        addTask(cardY + 268.0f, "3", "ENCOUNTER",
+                "BUILD A STANDALONE EVENT OR COMBAT", UiAction::MainEncounter,
+                {0.72f, 0.42f, 0.86f});
+        addTask(cardY + 346.0f, "4", "CREATURE",
+                "CREATE A STANDALONE STAT BLOCK", UiAction::MainCreature,
+                {0.88f, 0.64f, 0.25f});
+        addTask(cardY + 424.0f, "5", "LOAD FILE",
+                "CHOOSE ANY SAVED MAP, ENCOUNTER OR CREATURE", UiAction::MainLoad,
                 {0.30f, 0.62f, 0.90f});
 
-        AddUiButton(vertices, cardX + 38.0f, cardY + 500.0f, cardWidth - 76.0f,
+        AddUiButton(vertices, cardX + 38.0f, cardY + 514.0f, cardWidth - 190.0f,
+                    40.0f, "CONTINUE LAST", UiAction::MainContinue);
+        AddUiButton(vertices, cardX + cardWidth - 144.0f, cardY + 514.0f, 106.0f,
                     40.0f, "QUIT", UiAction::MainQuit);
-        AppendUiText(vertices, "PRESS 1, 2 OR 3    ESC QUITS", cardX + 112.0f,
-                     cardY + 560.0f, 1.35f, {0.50f, 0.55f, 0.63f}, 44);
+        AppendUiText(vertices, "PRESS 1 TO 5    ESC QUITS", cardX + 142.0f,
+                     cardY + 580.0f, 1.35f, {0.50f, 0.55f, 0.63f}, 44);
 
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
@@ -2645,7 +3297,9 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
     bool dungeonPoiSelected = gSelectedDungeonPoiIndex >= 0 &&
                               gSelectedDungeonPoiIndex < static_cast<int>(gPois.size()) &&
                               gPois[static_cast<size_t>(gSelectedDungeonPoiIndex)].kind == PoiKind::Dungeon;
-    AddUiButton(vertices, kUiWidth - 132.0f, 8.0f, 58.0f, 24.0f, "DNG",
+    AddUiButton(vertices, kUiWidth - 174.0f, 8.0f, 52.0f, 24.0f, "MENU",
+                UiAction::ReturnMainMenu);
+    AddUiButton(vertices, kUiWidth - 117.0f, 8.0f, 47.0f, 24.0f, "DNG",
                 UiAction::OpenDungeons, 0, dungeonPoiSelected);
     AddUiButton(vertices, kUiWidth - 69.0f, 8.0f, 59.0f, 24.0f, "HELP", UiAction::Help);
 
@@ -2769,7 +3423,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
     AddUiButton(vertices, x0 + 186.0f, 544.0f, 58.0f, h, "REDO", UiAction::Redo);
     AddUiButton(vertices, x0, 572.0f, 78.0f, h, "CLEAR", UiAction::Clear);
     AddUiButton(vertices, x0 + 83.0f, 572.0f, 78.0f, h, "EXPORT", UiAction::Export);
-    AddUiButton(vertices, x0 + 166.0f, 572.0f, 78.0f, h, "NAME", UiAction::ProjectName);
+    AddUiButton(vertices, x0 + 166.0f, 572.0f, 78.0f, h, "SAVE AS", UiAction::SaveAs);
 
     headingText("VIEW", 606.0f);
     AddUiButton(vertices, x0, 620.0f, 78.0f, h, "GRID", UiAction::ToggleGrid, 0, gShowGrid);
@@ -2968,10 +3622,14 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
         AddUiButton(vertices, x0 + 124.0f, 434.0f, 120.0f, h, "REVEAL ALL", UiAction::FogRevealAll);
 
         headingText("SPECIAL MARKERS", 472.0f);
-        AddUiButton(vertices, x0, 488.0f, 119.0f, h, "ENTRANCE", UiAction::DungeonPlaceEntrance,
+        AddUiButton(vertices, x0, 488.0f, 57.0f, h, "ENTRY", UiAction::DungeonPlaceEntrance,
                     0, gDungeonPlacementMode == DungeonPlacementMode::Entrance);
-        AddUiButton(vertices, x0 + 124.0f, 488.0f, 120.0f, h, "EXIT", UiAction::DungeonPlaceExit,
+        AddUiButton(vertices, x0 + 62.0f, 488.0f, 57.0f, h, "EXIT", UiAction::DungeonPlaceExit,
                     0, gDungeonPlacementMode == DungeonPlacementMode::Exit);
+        AddUiButton(vertices, x0 + 124.0f, 488.0f, 57.0f, h, "MARKER", UiAction::DungeonAddMarker,
+                    0, gDungeonPlacementMode == DungeonPlacementMode::Marker);
+        AddUiButton(vertices, x0 + 186.0f, 488.0f, 58.0f, h, "ENCOUNT", UiAction::DungeonAddEncounter,
+                    0, gDungeonPlacementMode == DungeonPlacementMode::Encounter);
         AppendUiText(vertices, dungeon && dungeon->hasEntrance ? "ENTRANCE SET" : "ENTRANCE NOT SET",
                      x0, 518.0f, 1.4f, dungeon && dungeon->hasEntrance
                                                    ? Vec3{0.38f, 0.90f, 0.46f}
@@ -2988,9 +3646,10 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                     gShowGrid);
 
         headingText("PROJECT", 596.0f);
-        AddUiButton(vertices, x0, 612.0f, 78.0f, h, "SAVE", UiAction::Save);
-        AddUiButton(vertices, x0 + 83.0f, 612.0f, 78.0f, h, "LOAD", UiAction::Load);
-        AddUiButton(vertices, x0 + 166.0f, 612.0f, 78.0f, h, "CLEAR", UiAction::Clear);
+        AddUiButton(vertices, x0, 612.0f, 57.0f, h, "SAVE", UiAction::Save);
+        AddUiButton(vertices, x0 + 62.0f, 612.0f, 57.0f, h, "SAVE AS", UiAction::SaveAs);
+        AddUiButton(vertices, x0 + 124.0f, 612.0f, 57.0f, h, "LOAD", UiAction::Load);
+        AddUiButton(vertices, x0 + 186.0f, 612.0f, 58.0f, h, "CLEAR", UiAction::Clear);
 
         headingText("STATUS", 650.0f);
         const std::string brushName = dungeon && gDungeonBrush >= 0 &&
@@ -3033,8 +3692,14 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
         const bool keybindHelp =
             gModalType == ModalType::Info &&
             (gInfoTitle == "KEYBOARD & MOUSE HELP" || gInfoTitle == "DUNGEON MAPPER HELP");
-        float mw = keybindHelp ? std::min(760.0f, static_cast<float>(gWindowWidth) - 60.0f)
-                               : 560.0f;
+        const bool encounterBuilder = gModalType == ModalType::Encounter ||
+                                      gModalType == ModalType::EncounterRunner;
+        const bool creatureBuilder = gModalType == ModalType::CreatureBuilder;
+        float mw = (creatureBuilder || gModalType == ModalType::Encounter)
+                       ? std::min(1180.0f, static_cast<float>(gWindowWidth) - 40.0f)
+                       : (keybindHelp || encounterBuilder)
+                       ? std::min(760.0f, static_cast<float>(gWindowWidth) - 60.0f)
+                       : 560.0f;
         float mh = keybindHelp
                        ? std::min(760.0f, static_cast<float>(gWindowHeight) - 60.0f)
                        : (gModalType == ModalType::DungeonManager
@@ -3043,7 +3708,11 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                               ? 420.0f
                        : ((gModalType == ModalType::Info || gModalType == ModalType::Confirm)
                               ? 320.0f
-                              : (gModalFields.size() > 1 ? 290.0f : 220.0f))));
+                               : (creatureBuilder
+                                      ? std::min(820.0f, static_cast<float>(gWindowHeight) - 40.0f)
+                               : (encounterBuilder
+                                      ? std::min(700.0f, static_cast<float>(gWindowHeight) - 60.0f)
+                                      : (gModalFields.size() > 1 ? 290.0f : 220.0f))))));
         float mx = (gWindowWidth - mw) * 0.5f, my = (gWindowHeight - mh) * 0.5f;
         AppendUiRect(vertices, mx, my, mw, mh, {0.10f, 0.12f, 0.16f});
         AppendUiRect(vertices, mx, my, mw, 4.0f, {0.75f, 0.57f, 0.20f});
@@ -3051,11 +3720,15 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                             gModalType == ModalType::City ? "NEW CITY" :
                             gModalType == ModalType::Poi ? "NEW POINT OF INTEREST" :
                             gModalType == ModalType::Encounter
-                                ? (gEditingEncounterIndex >= 0 ? "EDIT ENCOUNTER" : "NEW ENCOUNTER") :
+                                ? (gEditingEncounterIndex >= 0 ? "ENCOUNTER BUILDER - EDIT"
+                                                               : "ENCOUNTER BUILDER - NEW") :
+                            gModalType == ModalType::EncounterRunner ? "RUN ENCOUNTER" :
+                            gModalType == ModalType::CreatureBuilder ? "CREATURE STAT BLOCK" :
                             gModalType == ModalType::TerrainEditor ? "TERRAIN EDITOR" :
                             gModalType == ModalType::DungeonManager ? "DUNGEON MANAGER" :
                             gModalType == ModalType::DungeonDetails
                                 ? (gEditingDungeonIndex >= 0 ? "EDIT DUNGEON" : "NEW DUNGEON") :
+                            gModalType == ModalType::DungeonMarker ? "DUNGEON MARKER" :
                             gModalType == ModalType::Info ? gInfoTitle.c_str() :
                             gModalType == ModalType::Confirm ? gInfoTitle.c_str() :
                             gModalType == ModalType::ProjectName ? "PROJECT FILE" :
@@ -3108,6 +3781,57 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                         hasMap ? "RELINK FILE" : "LINK FILE", UiAction::DungeonManagerLink);
             AddUiButton(vertices, mx + mw - 112.0f, my + mh - 48.0f, 88.0f, 28.0f,
                         "CLOSE", UiAction::ModalCancel);
+        } else if (gModalType == ModalType::EncounterRunner) {
+            Encounter *encounter = gRunningEncounterIndex >= 0 &&
+                                           gRunningEncounterIndex < static_cast<int>(gEncounters.size())
+                                       ? &gEncounters[static_cast<size_t>(gRunningEncounterIndex)]
+                                       : nullptr;
+            if (encounter) {
+                AppendUiText(vertices, encounter->name, mx + 24.0f, my + 66.0f, 2.1f,
+                             {0.92f, 0.76f, 0.35f}, 48);
+                AppendUiText(vertices, "ROUND " + std::to_string(encounter->currentRound),
+                             mx + 24.0f, my + 102.0f, 1.7f,
+                             {0.45f, 0.78f, 0.94f}, 20);
+                AddUiButton(vertices, mx + 150.0f, my + 92.0f, 74.0f, 26.0f, "PREVIOUS",
+                            UiAction::EncounterRunnerPrevious);
+                AddUiButton(vertices, mx + 230.0f, my + 92.0f, 58.0f, 26.0f, "NEXT",
+                            UiAction::EncounterRunnerNext);
+                AddUiButton(vertices, mx + 294.0f, my + 92.0f, 92.0f, 26.0f, "NEXT ROUND",
+                            UiAction::EncounterRunnerRound);
+                AddUiButton(vertices, mx + 410.0f, my + 92.0f, 58.0f, 26.0f, "-1 HP",
+                            UiAction::EncounterRunnerDamage);
+                AddUiButton(vertices, mx + 474.0f, my + 92.0f, 58.0f, 26.0f, "+1 HP",
+                            UiAction::EncounterRunnerHeal);
+                AddUiButton(vertices, mx + 538.0f, my + 92.0f, 104.0f, 26.0f, "DEFEATED",
+                            UiAction::EncounterRunnerToggleDefeated);
+
+                float participantY = my + 138.0f;
+                for (size_t index = 0; index < encounter->participants.size() && index < 12; ++index) {
+                    const EncounterParticipant &participant = encounter->participants[index];
+                    bool active = static_cast<int>(index) == encounter->activeParticipant;
+                    AppendUiRect(vertices, mx + 24.0f, participantY, mw - 48.0f, 34.0f,
+                                 active ? Vec3{0.20f, 0.28f, 0.38f} : Vec3{0.14f, 0.16f, 0.20f});
+                    std::string line = (active ? "> " : "  ") + participant.name +
+                        "   INIT " + std::to_string(participant.initiative) +
+                        "   HP " + std::to_string(participant.currentHitPoints);
+                    if (!participant.conditions.empty()) line += "   " + participant.conditions;
+                    if (participant.defeated) line += "   DEFEATED";
+                    AppendUiText(vertices, line, mx + 34.0f, participantY + 11.0f, 1.5f,
+                                 participant.defeated ? Vec3{0.65f, 0.46f, 0.46f}
+                                                      : Vec3{0.90f, 0.92f, 0.95f}, 78);
+                    participantY += 39.0f;
+                }
+                if (encounter->participants.empty())
+                    AppendUiText(vertices, "NO CREATURE PARTICIPANTS - USE EFFECTS AND TABLES",
+                                 mx + 24.0f, participantY, 1.5f,
+                                 {0.68f, 0.73f, 0.80f}, 64);
+                AppendUiText(vertices,
+                             "RUN STATE IS SAVED WITH THE ENCOUNTER. CLOSE RETURNS TO EDITING.",
+                             mx + 24.0f, my + mh - 78.0f, 1.35f,
+                             {0.62f, 0.68f, 0.76f}, 76);
+            }
+            AddUiButton(vertices, mx + mw - 112.0f, my + mh - 48.0f, 88.0f, 28.0f,
+                        "CLOSE", UiAction::ModalCancel);
         } else if (gModalType == ModalType::Info) {
             const float lineSpacing = keybindHelp ? 20.0f : 34.0f;
             for (size_t i = 0; i < gInfoLines.size(); ++i) {
@@ -3135,7 +3859,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
             AddUiButton(vertices, mx + mw - 112.0f, my + mh - 48.0f, 88.0f, 28.0f,
                         "CONFIRM", UiAction::ModalAccept);
         } else {
-            const char *fieldLabels[4] = {"NAME", "DETAILS", "", ""};
+            const char *fieldLabels[27] = {"NAME", "DETAILS", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""};
             if (gModalType == ModalType::Search) fieldLabels[0] = "SEARCH";
             if (gModalType == ModalType::Region || gModalType == ModalType::City) fieldLabels[1] = "RULER";
             if (gModalType == ModalType::Poi) {
@@ -3145,6 +3869,43 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                                 PoiKindName(static_cast<PoiKind>(i)), UiAction::ModalPoiKind, i,
                                 static_cast<int>(gModalPoiKind) == i);
                 }
+            }
+            if (gModalType == ModalType::DungeonMarker) {
+                static const char *markerNames[] = {"ROOM", "ENCOUNTER", "TRAP", "TREASURE",
+                                                    "SECRET", "STAIRS", "PORTAL", "NOTE"};
+                for (int i = 0; i < 8; ++i) {
+                    float kindX = mx + 24.0f + static_cast<float>(i % 4) * 128.0f;
+                    float kindY = my + 54.0f + static_cast<float>(i / 4) * 26.0f;
+                    AddUiButton(vertices, kindX, kindY, 122.0f, 22.0f, markerNames[i],
+                                UiAction::DungeonMarkerKind, i,
+                                static_cast<int>(gDungeonMarkerKind) == i);
+                }
+                fieldLabels[0] = "MARKER NAME";
+                fieldLabels[1] = "DESCRIPTION OR GM NOTE";
+            }
+            if (gModalType == ModalType::Encounter) {
+                fieldLabels[1] = "OVERVIEW OR NONCOMBAT EVENT";
+                fieldLabels[2] = "CREATURES OPTIONAL - 3 GOBLINS; 1 OGRE";
+                fieldLabels[3] = "EFFECT CHAIN - FIRST STEP > NEXT STEP";
+                fieldLabels[4] = "TRIGGER";
+                fieldLabels[5] = "OBJECTIVE";
+                fieldLabels[6] = "ENVIRONMENT";
+                fieldLabels[7] = "GM NOTES";
+                fieldLabels[8] = "REWARDS";
+                fieldLabels[9] = "SUCCESS OUTCOME";
+                fieldLabels[10] = "FAILURE OUTCOME";
+                fieldLabels[11] = "LINKED SOURCE FILE";
+            }
+            if (gModalType == ModalType::CreatureBuilder) {
+                const char *creatureLabels[27] = {
+                    "NAME", "SIZE, TYPE AND ALIGNMENT", "ARMOR CLASS", "HIT POINTS", "SPEED",
+                    "STR", "DEX", "CON", "INT", "WIS", "CHA", "SAVING THROWS AND SKILLS",
+                    "SENSES AND LANGUAGES", "CHALLENGE RATING", "TRAITS",
+                    "SPECIAL ABILITIES - NAME=DESCRIPTION; ...", "ACTIONS", "REACTIONS",
+                    "LEGENDARY ACTIONS", "DAMAGE VULNERABILITIES", "DAMAGE RESISTANCES",
+                    "DAMAGE IMMUNITIES", "CONDITION IMMUNITIES", "PROFICIENCY BONUS",
+                    "PASSIVE PERCEPTION", "SPELLCASTING", "PORTRAIT OR TOKEN FILE"};
+                for (int index = 0; index < 27; ++index) fieldLabels[index] = creatureLabels[index];
             }
             if (gModalType == ModalType::TerrainEditor) {
                 const std::vector<TerrainDefinition> &definitions = EditedTerrainDefinitions();
@@ -3175,24 +3936,176 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
                                   previewBlue / 255.0f});
                 }
             }
-            float fieldsY = my + ((gModalType == ModalType::Poi ||
-                                   gModalType == ModalType::TerrainEditor)
-                                      ? 98.0f
-                                      : 62.0f);
+            float fieldsY = my + (gModalType == ModalType::DungeonMarker
+                                      ? 116.0f
+                                      : ((gModalType == ModalType::Poi ||
+                                          gModalType == ModalType::TerrainEditor)
+                                             ? 98.0f : 62.0f));
+            const float fieldStep = creatureBuilder ? 47.0f : 62.0f;
+            auto fieldY = [&](size_t index) {
+                if (gModalType == ModalType::Encounter && index >= 4)
+                    return fieldsY + static_cast<float>(index - 4) * 62.0f;
+                if (!creatureBuilder) return fieldsY + static_cast<float>(index) * fieldStep;
+                if (index < 5) return fieldsY + static_cast<float>(index) * fieldStep;
+                if (index <= 10) return fieldsY + 5.0f * fieldStep;
+                if (index >= 19) return fieldsY + static_cast<float>(index - 19) * 62.0f;
+                return fieldsY + static_cast<float>(6 + index - 11) * fieldStep;
+            };
             for (size_t i = 0; i < gModalFields.size(); ++i) {
-                float fy = fieldsY + static_cast<float>(i) * 62.0f;
-                AppendUiText(vertices, fieldLabels[i], mx + 24.0f, fy, 1.5f, heading);
+                float fy = fieldY(i);
+                if (creatureBuilder && i >= 5 && i <= 10) {
+                    float segment = 690.0f / 6.0f;
+                    float fx = mx + 24.0f + static_cast<float>(i - 5) * segment;
+                    AppendUiText(vertices, fieldLabels[i], fx, fy, 1.4f, heading, 4);
+                    Vec3 scoreColor = static_cast<int>(i) == gModalField
+                                          ? Vec3{0.20f, 0.28f, 0.38f}
+                                          : Vec3{0.14f, 0.16f, 0.20f};
+                    AppendUiRect(vertices, fx, fy + 15.0f, segment - 6.0f, 32.0f, scoreColor);
+                    std::string shown = gModalFields[i];
+                    if (static_cast<int>(i) != gModalField && !shown.empty()) {
+                        try {
+                            int score = std::stoi(shown);
+                            int modifier = campaign_tools::AbilityModifier(score);
+                            shown += modifier >= 0 ? "  +" : "  ";
+                            shown += std::to_string(modifier);
+                        } catch (...) {}
+                    }
+                    if (static_cast<int>(i) == gModalField) shown += "_";
+                    AppendUiText(vertices, shown, fx + 8.0f, fy + 25.0f, 1.7f,
+                                 {0.95f, 0.95f, 0.96f}, 4);
+                    gUiHits.push_back({fx, fy + 15.0f, segment - 6.0f, 32.0f,
+                                       UiAction::ModalNext, static_cast<int>(i)});
+                    continue;
+                }
+                const bool advancedCreatureField = creatureBuilder && i >= 19;
+                const bool encounterDetailField = gModalType == ModalType::Encounter && i >= 4;
+                float fieldX = (advancedCreatureField || encounterDetailField)
+                                   ? mx + 738.0f : mx + 24.0f;
+                float fieldWidth = (advancedCreatureField || encounterDetailField)
+                                       ? mw - 762.0f
+                                       : ((creatureBuilder || gModalType == ModalType::Encounter)
+                                              ? 690.0f : mw - 48.0f);
+                AppendUiText(vertices, fieldLabels[i], fieldX, fy, 1.5f, heading);
                 Vec3 fieldColor = static_cast<int>(i) == gModalField ? Vec3{0.20f, 0.28f, 0.38f}
                                                                       : Vec3{0.14f, 0.16f, 0.20f};
-                AppendUiRect(vertices, mx + 24.0f, fy + 15.0f, mw - 48.0f, 32.0f, fieldColor);
+                AppendUiRect(vertices, fieldX, fy + 15.0f, fieldWidth, 32.0f, fieldColor);
                 std::string shown = gModalFields[i];
                 if (static_cast<int>(i) == gModalField) shown += "_";
                 if (shown.size() > 68) shown = "< " + shown.substr(shown.size() - 66);
-                AppendUiText(vertices, shown, mx + 32.0f, fy + 25.0f, 1.7f,
-                             {0.95f, 0.95f, 0.96f}, 68);
-                gUiHits.push_back({mx + 24.0f, fy + 15.0f, mw - 48.0f, 32.0f,
-                                   i == 0 ? UiAction::ModalPrevious : UiAction::ModalNext,
-                                   static_cast<int>(i)});
+                int visibleCharacters = (advancedCreatureField || encounterDetailField) ? 36 : 68;
+                AppendUiText(vertices, shown, fieldX + 8.0f, fy + 25.0f, 1.7f,
+                             {0.95f, 0.95f, 0.96f}, visibleCharacters);
+                gUiHits.push_back({fieldX, fy + 15.0f, fieldWidth, 32.0f,
+                                    i == 0 ? UiAction::ModalPrevious : UiAction::ModalNext,
+                                    static_cast<int>(i)});
+            }
+            if (creatureBuilder && gModalFields.size() == 27) {
+                AddUiButton(vertices, mx + 470.0f, fieldY(15) - 5.0f,
+                            104.0f, 20.0f, "ADD ABILITY", UiAction::CreatureAddAbility);
+                AddUiButton(vertices, mx + 580.0f, fieldY(15) - 5.0f,
+                            110.0f, 20.0f, "REMOVE LAST", UiAction::CreatureRemoveAbility);
+            }
+            if (gModalType == ModalType::Encounter && gModalFields.size() == 12) {
+                constexpr int rowsPerPage = 5;
+                const float sectionY = my + 310.0f;
+                AppendUiText(vertices, "ROLL TABLES", mx + 24.0f, sectionY, 1.6f,
+                             {0.90f, 0.76f, 0.35f}, 24);
+                AddUiButton(vertices, mx + 230.0f, sectionY - 8.0f, 154.0f, 26.0f,
+                            "LOAD ENCOUNTER", UiAction::EncounterLoadFile);
+                AddUiButton(vertices, mx + 390.0f, sectionY - 8.0f, 126.0f, 26.0f,
+                            "ADD CREATURE", UiAction::EncounterAddCreature);
+                AddUiButton(vertices, mx + 522.0f, sectionY - 8.0f, 64.0f, 26.0f,
+                            "RUN", UiAction::EncounterRun);
+
+                const float controlsY = sectionY + 22.0f;
+                AddUiButton(vertices, mx + 24.0f, controlsY, 56.0f, 24.0f, "PREV",
+                            UiAction::EncounterPreviousTable);
+                AddUiButton(vertices, mx + 86.0f, controlsY, 56.0f, 24.0f, "NEXT",
+                            UiAction::EncounterNextTable);
+                AddUiButton(vertices, mx + 148.0f, controlsY, 92.0f, 24.0f, "ADD TABLE",
+                            UiAction::EncounterAddTable);
+                if (!gEncounterTableDrafts.empty())
+                    AddUiButton(vertices, mx + 246.0f, controlsY, 108.0f, 24.0f,
+                                "DELETE TABLE", UiAction::EncounterDeleteTable);
+                if (!gEncounterTableDrafts.empty())
+                    AddUiButton(vertices, mx + 360.0f, controlsY, 58.0f, 24.0f,
+                                "ROLL", UiAction::EncounterRollTable);
+                std::string tablePosition = gEncounterTableDrafts.empty()
+                                                ? "NO TABLES - OPTIONAL"
+                                                : "TABLE " + std::to_string(gEncounterActiveTable + 1) +
+                                                      " OF " + std::to_string(gEncounterTableDrafts.size());
+                AppendUiText(vertices, tablePosition, mx + 430.0f, controlsY + 8.0f, 1.35f,
+                             {0.68f, 0.73f, 0.80f}, 35);
+
+                if (!gEncounterTableDrafts.empty()) {
+                    EncounterTableDraft &table =
+                        gEncounterTableDrafts[static_cast<size_t>(gEncounterActiveTable)];
+                    const float detailsY = controlsY + 31.0f;
+                    AppendUiText(vertices, "TABLE NAME", mx + 24.0f, detailsY, 1.3f, heading, 18);
+                    AppendUiText(vertices, "DIE SIDES", mx + 518.0f, detailsY, 1.3f, heading, 12);
+                    auto addEncounterCell = [&](float x, float y, float width, int field,
+                                                const std::string &value, int maxChars) {
+                        Vec3 color = field == gModalField ? Vec3{0.20f, 0.28f, 0.38f}
+                                                         : Vec3{0.14f, 0.16f, 0.20f};
+                        AppendUiRect(vertices, x, y, width, 28.0f, color);
+                        std::string shown = value;
+                        if (field == gModalField) shown += "_";
+                        if (shown.size() > static_cast<size_t>(maxChars))
+                            shown = "< " + shown.substr(shown.size() - maxChars + 2);
+                        AppendUiText(vertices, shown, x + 7.0f, y + 8.0f, 1.45f,
+                                     {0.95f, 0.95f, 0.96f}, maxChars);
+                        gUiHits.push_back({x, y, width, 28.0f, UiAction::ModalNext, field});
+                    };
+                    addEncounterCell(mx + 24.0f, detailsY + 14.0f, 480.0f, 100, table.name, 46);
+                    addEncounterCell(mx + 518.0f, detailsY + 14.0f, 90.0f, 101,
+                                     table.dieSides, 6);
+
+                    const float headerY = detailsY + 50.0f;
+                    AppendUiText(vertices, "FROM", mx + 30.0f, headerY, 1.3f, heading, 8);
+                    AppendUiText(vertices, "TO", mx + 124.0f, headerY, 1.3f, heading, 8);
+                    AppendUiText(vertices, "RESULT", mx + 218.0f, headerY, 1.3f, heading, 12);
+                    int firstRow = gEncounterTableRowPage * rowsPerPage;
+                    int lastRow = std::min(firstRow + rowsPerPage,
+                                           static_cast<int>(table.rows.size()));
+                    for (int row = firstRow; row < lastRow; ++row) {
+                        const EncounterTableRowDraft &draft = table.rows[static_cast<size_t>(row)];
+                        float rowY = headerY + 17.0f + static_cast<float>(row - firstRow) * 31.0f;
+                        addEncounterCell(mx + 24.0f, rowY, 88.0f, 200 + row * 3,
+                                         draft.minimumRoll, 6);
+                        addEncounterCell(mx + 118.0f, rowY, 88.0f, 201 + row * 3,
+                                         draft.maximumRoll, 6);
+                        addEncounterCell(mx + 212.0f, rowY, 502.0f, 202 + row * 3,
+                                         draft.result, 48);
+                    }
+                    if (table.rows.empty())
+                        AppendUiText(vertices, "NO ROWS YET - ADD A ROW TO BEGIN", mx + 24.0f,
+                                     headerY + 31.0f, 1.35f, {0.62f, 0.68f, 0.76f}, 50);
+
+                    const float rowControlsY = headerY + 176.0f;
+                    AddUiButton(vertices, mx + 24.0f, rowControlsY, 76.0f, 24.0f, "ADD ROW",
+                                UiAction::EncounterAddTableRow);
+                    AddUiButton(vertices, mx + 106.0f, rowControlsY, 92.0f, 24.0f, "DELETE ROW",
+                                UiAction::EncounterDeleteTableRow);
+                    AddUiButton(vertices, mx + 216.0f, rowControlsY, 56.0f, 24.0f, "PREV",
+                                UiAction::EncounterPreviousRows);
+                    AddUiButton(vertices, mx + 278.0f, rowControlsY, 56.0f, 24.0f, "NEXT",
+                                UiAction::EncounterNextRows);
+                    int pageCount = std::max(1, (static_cast<int>(table.rows.size()) +
+                                                 rowsPerPage - 1) / rowsPerPage);
+                    AppendUiText(vertices, "ROWS PAGE " + std::to_string(gEncounterTableRowPage + 1) +
+                                               " OF " + std::to_string(pageCount),
+                                 mx + 350.0f, rowControlsY + 8.0f, 1.3f,
+                                 {0.68f, 0.73f, 0.80f}, 28);
+                    if (!gEncounterRollResult.empty())
+                        AppendUiText(vertices, gEncounterRollResult, mx + 500.0f,
+                                     rowControlsY + 8.0f, 1.25f,
+                                     {0.42f, 0.88f, 0.58f}, 28);
+                } else {
+                    AppendUiText(vertices,
+                                 "ADD A TABLE FOR RANDOM RESULTS, OR LEAVE THIS AS A SIMPLE EVENT",
+                                 mx + 24.0f, controlsY + 48.0f, 1.35f,
+                                 {0.62f, 0.68f, 0.76f}, 76);
+                }
             }
             float buttonY = my + mh - 48.0f;
             if (!gModalError.empty())
@@ -3202,6 +4115,7 @@ void RebuildGuiMesh(GLuint vbo, GLsizei &outVertexCount) {
             AddUiButton(vertices, mx + mw - 112.0f, buttonY, 88.0f, 28.0f,
                         gModalType == ModalType::ProjectName ? "APPLY" :
                         gModalType == ModalType::Search ? "FIND" :
+                        gModalType == ModalType::CreatureBuilder ? "SAVE" :
                         gModalType == ModalType::TerrainEditor ? (gCreatingTerrain ? "CREATE" : "SAVE") :
                         gModalType == ModalType::DungeonDetails
                             ? (gEditingDungeonIndex >= 0 ? "SAVE" : "CREATE") :
@@ -3225,7 +4139,9 @@ void HandleUiAction(const UiHit &hit) {
         case UiAction::None: break;
         case UiAction::MainWorld:
             gMainMenuOpen = false;
-            if (!gEditorSessionStarted || gProjectDocument.standaloneDungeon) StartWorldDocument();
+            if (!gEditorSessionStarted || gProjectDocument.standaloneDungeon ||
+                gProjectDocument.standaloneEncounter || gProjectDocument.standaloneCreature)
+                StartWorldDocument();
             else if (gEditorTab == EditorTab::Dungeon) ReturnToWorldTab();
             gEditorSessionStarted = true;
             gPlacementMode = PlacementMode::None;
@@ -3235,6 +4151,24 @@ void HandleUiAction(const UiHit &hit) {
             if (gEditorSessionStarted && gProjectDocument.standaloneDungeon && !gDungeons.empty())
                 OpenDungeonTab(0);
             else StartStandaloneDungeon();
+            gEditorSessionStarted = true;
+            break;
+        case UiAction::MainEncounter:
+            gMainMenuOpen = false;
+            if (gEditorSessionStarted && gProjectDocument.standaloneEncounter &&
+                !gEncounters.empty())
+                EditEncounter(0);
+            else
+                StartStandaloneEncounter();
+            gEditorSessionStarted = true;
+            break;
+        case UiAction::MainCreature:
+            gMainMenuOpen = false;
+            if (gEditorSessionStarted && gProjectDocument.standaloneCreature &&
+                !gProjectDocument.creatures.empty())
+                OpenCreatureBuilder();
+            else
+                StartStandaloneCreature();
             gEditorSessionStarted = true;
             break;
         case UiAction::MainLoad:
@@ -3248,6 +4182,19 @@ void HandleUiAction(const UiHit &hit) {
             if (!RequestProjectLoad()) gMainMenuOpen = true;
             else gEditorSessionStarted = true;
             break;
+        case UiAction::MainContinue: {
+            std::error_code error;
+            if (!gProjectFile.empty() && std::filesystem::exists(gProjectFile, error) &&
+                LoadProjectFromPath(gProjectFile, false)) {
+                gMainMenuOpen = false;
+                gEditorSessionStarted = true;
+            } else {
+                gMainMenuOpen = false;
+                if (!RequestProjectLoad()) gMainMenuOpen = true;
+                else gEditorSessionStarted = true;
+            }
+            break;
+        }
         case UiAction::MainQuit: glfwSetWindowShouldClose(gWindow, GLFW_TRUE); break;
         case UiAction::SetMode:
             gPaintMode = static_cast<PaintMode>(hit.value);
@@ -3319,9 +4266,19 @@ void HandleUiAction(const UiHit &hit) {
         case UiAction::Undo: Undo(); break;
         case UiAction::Redo: Redo(); break;
         case UiAction::Save: RequestProjectSave(); break;
+        case UiAction::SaveAs:
+            if (gModalType == ModalType::Encounter || gModalType == ModalType::CreatureBuilder) {
+                CloseModal(true);
+                if (gModalType == ModalType::None && gMainMenuOpen) RequestProjectSaveAs();
+            } else {
+                RequestProjectSaveAs();
+            }
+            break;
         case UiAction::Load: RequestProjectLoad(); break;
+        case UiAction::ReturnMainMenu: ReturnToMainMenu(); break;
         case UiAction::Clear: RequestClearActiveLayer(); break;
         case UiAction::Export: ExportScreenshot(); break;
+        case UiAction::ExportSheet: ExportTextSheet(); break;
         case UiAction::ToggleGrid: gShowGrid = !gShowGrid; break;
         case UiAction::ToggleGeometry: gHexGrid = !gHexGrid; ++gSceneRevision; MarkProjectDirty(); break;
         case UiAction::ToggleRegions: gShowRegions = !gShowRegions; break;
@@ -3367,7 +4324,11 @@ void HandleUiAction(const UiHit &hit) {
         case UiAction::SelectionElevationUp: AdjustSelectionElevation(1); break;
         case UiAction::SelectionClear: gSelectionActive = false; gSelectionDragging = false; break;
         case UiAction::ModalPrevious:
-        case UiAction::ModalNext: gModalField = hit.value; break;
+        case UiAction::ModalNext:
+            gModalField = hit.value;
+            if (gModalType == ModalType::Encounter && hit.value >= 200)
+                gEncounterSelectedTableRow = (hit.value - 200) / 3;
+            break;
         case UiAction::ModalAccept: CloseModal(true); break;
         case UiAction::ModalCancel: CloseModal(false); break;
         case UiAction::ModalPoiKind:
@@ -3398,6 +4359,19 @@ void HandleUiAction(const UiHit &hit) {
                                         ? DungeonPlacementMode::None
                                         : DungeonPlacementMode::Exit;
             break;
+        case UiAction::DungeonAddMarker:
+            gDungeonPlacementMode = gDungeonPlacementMode == DungeonPlacementMode::Marker
+                                        ? DungeonPlacementMode::None
+                                        : DungeonPlacementMode::Marker;
+            break;
+        case UiAction::DungeonAddEncounter:
+            gDungeonPlacementMode = gDungeonPlacementMode == DungeonPlacementMode::Encounter
+                                        ? DungeonPlacementMode::None
+                                        : DungeonPlacementMode::Encounter;
+            break;
+        case UiAction::DungeonMarkerKind:
+            gDungeonMarkerKind = static_cast<DungeonMarkerKind>(std::clamp(hit.value, 0, 7));
+            break;
         case UiAction::DungeonFit: FitDungeonToWindow(); break;
         case UiAction::DungeonEditDetails: OpenDungeonDetailsForm(); break;
         case UiAction::DungeonManagerOpen:
@@ -3409,6 +4383,122 @@ void HandleUiAction(const UiHit &hit) {
             break;
         case UiAction::DungeonManagerNew: OpenNewDungeonForm(); break;
         case UiAction::DungeonManagerLink: LinkDungeonFileToSelectedPoi(); break;
+        case UiAction::EncounterAddCreature: AddCreatureFileToEncounter(); break;
+        case UiAction::EncounterLoadFile: LoadEncounterFileIntoBuilder(); break;
+        case UiAction::EncounterRun: StartEncounterRunner(); break;
+        case UiAction::EncounterRollTable: RollActiveEncounterTable(); break;
+        case UiAction::EncounterRunnerPrevious:
+        case UiAction::EncounterRunnerNext:
+        case UiAction::EncounterRunnerRound:
+        case UiAction::EncounterRunnerDamage:
+        case UiAction::EncounterRunnerHeal:
+        case UiAction::EncounterRunnerToggleDefeated:
+            if (gRunningEncounterIndex >= 0 &&
+                gRunningEncounterIndex < static_cast<int>(gEncounters.size())) {
+                Encounter &encounter = gEncounters[static_cast<size_t>(gRunningEncounterIndex)];
+                if (hit.action == UiAction::EncounterRunnerRound) {
+                    campaign_tools::AdvanceRound(encounter);
+                } else if (hit.action == UiAction::EncounterRunnerPrevious)
+                    campaign_tools::AdvanceTurn(encounter, -1);
+                else if (hit.action == UiAction::EncounterRunnerNext)
+                    campaign_tools::AdvanceTurn(encounter, 1);
+                else if (hit.action == UiAction::EncounterRunnerDamage)
+                    campaign_tools::AdjustActiveHitPoints(encounter, -1);
+                else if (hit.action == UiAction::EncounterRunnerHeal)
+                    campaign_tools::AdjustActiveHitPoints(encounter, 1);
+                else
+                    campaign_tools::ToggleActiveDefeated(encounter);
+                MarkProjectDirty();
+            }
+            break;
+        case UiAction::EncounterAddTable: {
+            EncounterTableDraft table;
+            table.rows.push_back({});
+            gEncounterTableDrafts.push_back(std::move(table));
+            gEncounterActiveTable = static_cast<int>(gEncounterTableDrafts.size()) - 1;
+            gEncounterTableRowPage = 0;
+            gEncounterSelectedTableRow = 0;
+            gModalField = 100;
+            gModalError.clear();
+            break;
+        }
+        case UiAction::EncounterDeleteTable:
+            if (!gEncounterTableDrafts.empty()) {
+                gEncounterTableDrafts.erase(gEncounterTableDrafts.begin() + gEncounterActiveTable);
+                gEncounterActiveTable = std::max(0, std::min(gEncounterActiveTable,
+                    static_cast<int>(gEncounterTableDrafts.size()) - 1));
+                gEncounterTableRowPage = 0;
+                gEncounterSelectedTableRow = -1;
+                gModalField = gEncounterTableDrafts.empty() ? 0 : 100;
+                gModalError.clear();
+            }
+            break;
+        case UiAction::EncounterPreviousTable:
+            if (!gEncounterTableDrafts.empty()) {
+                int count = static_cast<int>(gEncounterTableDrafts.size());
+                gEncounterActiveTable = (gEncounterActiveTable + count - 1) % count;
+                gEncounterTableRowPage = 0;
+                gEncounterSelectedTableRow = -1;
+                gModalField = 100;
+            }
+            break;
+        case UiAction::EncounterNextTable:
+            if (!gEncounterTableDrafts.empty()) {
+                gEncounterActiveTable = (gEncounterActiveTable + 1) %
+                                        static_cast<int>(gEncounterTableDrafts.size());
+                gEncounterTableRowPage = 0;
+                gEncounterSelectedTableRow = -1;
+                gModalField = 100;
+            }
+            break;
+        case UiAction::EncounterAddTableRow:
+            if (!gEncounterTableDrafts.empty()) {
+                auto &rows = gEncounterTableDrafts[static_cast<size_t>(gEncounterActiveTable)].rows;
+                rows.push_back({});
+                gEncounterSelectedTableRow = static_cast<int>(rows.size()) - 1;
+                gEncounterTableRowPage = gEncounterSelectedTableRow / 5;
+                gModalField = 200 + gEncounterSelectedTableRow * 3;
+                gModalError.clear();
+            }
+            break;
+        case UiAction::EncounterDeleteTableRow:
+            if (!gEncounterTableDrafts.empty()) {
+                auto &rows = gEncounterTableDrafts[static_cast<size_t>(gEncounterActiveTable)].rows;
+                if (gEncounterSelectedTableRow >= 0 &&
+                    gEncounterSelectedTableRow < static_cast<int>(rows.size())) {
+                    rows.erase(rows.begin() + gEncounterSelectedTableRow);
+                    if (rows.empty()) gEncounterSelectedTableRow = -1;
+                    else gEncounterSelectedTableRow = std::min(
+                        gEncounterSelectedTableRow, static_cast<int>(rows.size()) - 1);
+                    int pageCount = std::max(1, (static_cast<int>(rows.size()) + 4) / 5);
+                    gEncounterTableRowPage = std::min(gEncounterTableRowPage, pageCount - 1);
+                    gModalField = gEncounterSelectedTableRow < 0
+                                      ? 100 : 200 + gEncounterSelectedTableRow * 3;
+                    gModalError.clear();
+                }
+            }
+            break;
+        case UiAction::EncounterPreviousRows:
+            if (gEncounterTableRowPage > 0) {
+                --gEncounterTableRowPage;
+                gEncounterSelectedTableRow = -1;
+                gModalField = 100;
+            }
+            break;
+        case UiAction::EncounterNextRows:
+            if (!gEncounterTableDrafts.empty()) {
+                const auto &rows =
+                    gEncounterTableDrafts[static_cast<size_t>(gEncounterActiveTable)].rows;
+                int pageCount = std::max(1, (static_cast<int>(rows.size()) + 4) / 5);
+                if (gEncounterTableRowPage + 1 < pageCount) {
+                    ++gEncounterTableRowPage;
+                    gEncounterSelectedTableRow = -1;
+                    gModalField = 100;
+                }
+            }
+            break;
+        case UiAction::CreatureAddAbility: AppendCreatureAbilityTemplate(); break;
+        case UiAction::CreatureRemoveAbility: RemoveLastCreatureAbility(); break;
     }
     gUseUiTarget = false;
     UpdateWindowTitle();
@@ -3441,13 +4531,31 @@ void CharacterCallback(GLFWwindow * /*window*/, unsigned int codepoint) {
     if (gModalType == ModalType::TerrainEditor && gModalField > 0 &&
         (codepoint < '0' || codepoint > '9'))
         return;
+    if (gModalType == ModalType::CreatureBuilder && gModalField >= 5 && gModalField <= 10 &&
+        (codepoint < '0' || codepoint > '9'))
+        return;
+    const bool encounterNumber = gModalType == ModalType::Encounter &&
+        (gModalField == 101 ||
+         (gModalField >= 200 && (gModalField - 200) % 3 < 2));
+    if (encounterNumber && (codepoint < '0' || codepoint > '9')) return;
     size_t limit = 80;
-    if ((gModalType == ModalType::Encounter || gModalType == ModalType::DungeonDetails) &&
-        gModalField == 1)
+    if (gModalType == ModalType::CreatureBuilder && gModalField >= 5 && gModalField <= 10)
+        limit = 2;
+    else if (gModalType == ModalType::CreatureBuilder && gModalField > 0)
+        limit = 500;
+    else if (gModalType == ModalType::Encounter) {
+        if (encounterNumber) limit = 4;
+        else if (gModalField >= 200 || (gModalField >= 1 && gModalField <= 3)) limit = 500;
+    }
+    else if (gModalType == ModalType::DungeonDetails && gModalField == 1)
         limit = 240;
     else if (gModalType == ModalType::TerrainEditor && gModalField > 0) limit = 3;
-    if (codepoint >= 32 && codepoint <= 126 && gModalFields[gModalField].size() < limit) {
-        gModalFields[gModalField].push_back(static_cast<char>(codepoint));
+    std::string *target = gModalType == ModalType::Encounter
+                              ? EncounterModalText(gModalField)
+                              : (gModalField >= 0 && gModalField < static_cast<int>(gModalFields.size())
+                                     ? &gModalFields[static_cast<size_t>(gModalField)] : nullptr);
+    if (target && codepoint >= 32 && codepoint <= 126 && target->size() < limit) {
+        target->push_back(static_cast<char>(codepoint));
         gModalError.clear();
     }
 }
@@ -3725,7 +4833,11 @@ void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int 
             HandleUiAction({0.0f, 0.0f, 0.0f, 0.0f, UiAction::MainWorld, 0});
         else if (key == GLFW_KEY_2 || key == GLFW_KEY_KP_2)
             HandleUiAction({0.0f, 0.0f, 0.0f, 0.0f, UiAction::MainDungeon, 0});
-        else if (key == GLFW_KEY_3 || key == GLFW_KEY_KP_3 || key == GLFW_KEY_L)
+        else if (key == GLFW_KEY_3 || key == GLFW_KEY_KP_3)
+            HandleUiAction({0.0f, 0.0f, 0.0f, 0.0f, UiAction::MainEncounter, 0});
+        else if (key == GLFW_KEY_4 || key == GLFW_KEY_KP_4)
+            HandleUiAction({0.0f, 0.0f, 0.0f, 0.0f, UiAction::MainCreature, 0});
+        else if (key == GLFW_KEY_5 || key == GLFW_KEY_KP_5 || key == GLFW_KEY_L)
             HandleUiAction({0.0f, 0.0f, 0.0f, 0.0f, UiAction::MainLoad, 0});
         else if (key == GLFW_KEY_ESCAPE || key == GLFW_KEY_Q)
             glfwSetWindowShouldClose(window, GLFW_TRUE);
@@ -3759,8 +4871,22 @@ void KeyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int 
             return;
         }
         if (key == GLFW_KEY_ESCAPE) CloseModal(false);
-        else if (key == GLFW_KEY_BACKSPACE && !gModalFields.empty() && !gModalFields[gModalField].empty()) {
-            gModalFields[gModalField].pop_back();
+        else if (gModalType == ModalType::Encounter && key == GLFW_KEY_BACKSPACE) {
+            std::string *target = EncounterModalText(gModalField);
+            if (target && !target->empty()) {
+                target->pop_back();
+                gModalError.clear();
+            }
+        } else if (gModalType == ModalType::Encounter &&
+                   (key == GLFW_KEY_TAB || key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER)) {
+            std::vector<int> fields = EncounterEditableFields();
+            auto current = std::find(fields.begin(), fields.end(), gModalField);
+            if (current == fields.end() || ++current == fields.end()) gModalField = fields.front();
+            else gModalField = *current;
+        } else if (key == GLFW_KEY_BACKSPACE && !gModalFields.empty() &&
+                   gModalField >= 0 && gModalField < static_cast<int>(gModalFields.size()) &&
+                   !gModalFields[static_cast<size_t>(gModalField)].empty()) {
+            gModalFields[static_cast<size_t>(gModalField)].pop_back();
             gModalError.clear();
         } else if (key == GLFW_KEY_TAB && !gModalFields.empty())
             gModalField = (gModalField + 1) % static_cast<int>(gModalFields.size());
@@ -4082,6 +5208,20 @@ void RebuildDungeonTileMesh(GLuint vbo, GLsizei &outVertexCount) {
         if (dungeon->hasEntrance)
             appendSpecial(dungeon->entranceCol, dungeon->entranceRow, true);
         if (dungeon->hasExit) appendSpecial(dungeon->exitCol, dungeon->exitRow, false);
+        static const Vec3 markerColors[] = {
+            {0.92f, 0.76f, 0.35f}, {0.95f, 0.28f, 0.18f}, {0.88f, 0.38f, 0.16f},
+            {0.98f, 0.78f, 0.18f}, {0.68f, 0.32f, 0.88f}, {0.25f, 0.78f, 0.92f},
+            {0.32f, 0.90f, 0.66f}, {0.85f, 0.86f, 0.90f}};
+        for (const DungeonMarker &marker : dungeon->markers) {
+            if (gPlayerView && marker.gameMasterOnly) continue;
+            float x = static_cast<float>((marker.col * kTileSize - gCameraX) * gZoom);
+            float y = static_cast<float>((marker.row * kTileSize - gCameraY) * gZoom);
+            float size = static_cast<float>(kTileSize * gZoom);
+            float inset = size * 0.28f;
+            AppendUiRect(vertices, x + inset, y + inset, size - inset * 2.0f,
+                         size - inset * 2.0f,
+                         markerColors[static_cast<int>(marker.kind)]);
+        }
     }
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),

@@ -9,6 +9,8 @@
 
 struct ProjectDocument {
     bool standaloneDungeon = false;
+    bool standaloneEncounter = false;
+    bool standaloneCreature = false;
     std::vector<TerrainDefinition> terrainDefinitions = DefaultTerrainDefinitions();
     std::unordered_map<uint64_t, uint8_t> terrain;
     std::unordered_map<uint64_t, int8_t> elevation;
@@ -18,6 +20,7 @@ struct ProjectDocument {
     std::vector<City> cities;
     std::vector<PointOfInterest> pointsOfInterest;
     std::vector<Encounter> encounters;
+    std::vector<CreatureStatBlock> creatures;
     std::vector<Dungeon> dungeons;
     std::vector<Route> routes;
 

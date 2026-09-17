@@ -22,9 +22,11 @@ FetchContent_MakeAvailable(glfw)
 add_executable(MapDrawer
     src/main.cpp
     src/app_types.cpp
+    src/campaign_tools.cpp
     src/editor_commands.cpp
     src/editor_history.cpp
     src/editor_state.cpp
+    src/encounter_builder.cpp
     src/gl_lite.cpp
     src/grid_geometry.cpp
     src/logger.cpp
@@ -49,9 +51,11 @@ if (BUILD_TESTING)
     add_executable(MapDrawerCoreTests
         tests/core_tests.cpp
         src/app_types.cpp
+        src/campaign_tools.cpp
         src/editor_commands.cpp
         src/editor_history.cpp
         src/editor_state.cpp
+        src/encounter_builder.cpp
         src/gl_lite.cpp
         src/grid_geometry.cpp
         src/logger.cpp
@@ -69,7 +73,7 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME MapDrawerAllFeatures COMMAND MapDrawerCoreTests --headless)
     set(MAP_DRAWER_TEST_FEATURES
-        grid terrain elevation fog regions markers routes dungeons tools commands
+        grid terrain elevation fog regions markers routes dungeons encounters runner creatures workflows tools commands
         history state presentation persistence compatibility validation lookups
     )
     foreach(FEATURE IN LISTS MAP_DRAWER_TEST_FEATURES)

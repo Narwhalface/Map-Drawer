@@ -1,7 +1,9 @@
 #include "app_types.h"
+#include "campaign_tools.h"
 #include "editor_commands.h"
 #include "editor_history.h"
 #include "editor_state.h"
+#include "encounter_builder.h"
 #include "grid_geometry.h"
 #include "gl_lite.h"
 #include "mesh_buffer.h"
@@ -19,6 +21,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -30,6 +33,19 @@ void Check(bool condition, const char *description) {
     if (condition) return;
     std::cerr << "FAILED: " << description << '\n';
     ++gFailures;
+}
+
+bool ReplaceFirstInFile(const std::filesystem::path &path, const std::string &from,
+                        const std::string &to) {
+    std::ifstream input(path, std::ios::binary);
+    std::string contents((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+    const std::size_t position = contents.find(from);
+    if (position == std::string::npos) return false;
+    contents.replace(position, from.size(), to);
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+    return static_cast<bool>(output);
 }
 
 void TestGridGeometry() {
@@ -199,6 +215,169 @@ void TestDungeonFeature() {
           "dungeon fog and elevation can be painted");
     Check(!editor_commands::SetLayerValue(target, PaintMode::Region, key, 1),
           "dungeons reject overworld regions");
+
+    const DungeonMarkerKind markerKinds[] = {
+        DungeonMarkerKind::Room, DungeonMarkerKind::Encounter, DungeonMarkerKind::Trap,
+        DungeonMarkerKind::Treasure, DungeonMarkerKind::Secret, DungeonMarkerKind::Stairs,
+        DungeonMarkerKind::Portal, DungeonMarkerKind::Note};
+    for (std::size_t index = 0; index < std::size(markerKinds); ++index) {
+        DungeonMarker marker;
+        marker.col = static_cast<int32_t>(index);
+        marker.row = -static_cast<int32_t>(index);
+        marker.kind = markerKinds[index];
+        marker.name = "Marker " + std::to_string(index);
+        marker.description = "Dungeon content";
+        marker.gameMasterOnly = index % 2 == 0;
+        Check(campaign_tools::AddDungeonMarker(dungeon, std::move(marker)),
+              "every dungeon marker kind can be added");
+    }
+    Check(dungeon.markers.size() == std::size(markerKinds) &&
+              dungeon.markers[1].kind == DungeonMarkerKind::Encounter &&
+              !dungeon.markers[1].gameMasterOnly,
+          "dungeon marker positions, kinds, and visibility are retained");
+    Check(!campaign_tools::AddDungeonMarker(dungeon, DungeonMarker{}),
+          "unnamed dungeon markers are rejected");
+}
+
+void TestEncounterBuilder() {
+    Encounter encounter;
+    std::string error;
+    Check(ParseEncounterBuilderFields(
+              "3 Goblins; 1 Ogre",
+              "A warning bell rings > The gate closes > Reinforcements arrive",
+              "Complication D6: 1-2=Nothing happens; 3-4=A patrol arrives; 5-6=The bridge falls || "
+              "Treasure d4: 1=Empty; 2-4=Hidden cache",
+              encounter, error),
+          "encounter builder parses creatures, effect chains, and multiple roll tables");
+    Check(encounter.creatures.size() == 2 && encounter.creatures[0].count == 3 &&
+              encounter.creatures[1].name == "Ogre",
+          "encounter builder keeps optional creature groups structured");
+    Check(encounter.effects.size() == 3 &&
+              encounter.effects[1].description == "The gate closes",
+          "encounter builder preserves ordered effect steps");
+    Check(encounter.rollTables.size() == 2 && encounter.rollTables[0].dieSides == 6 &&
+              encounter.rollTables[0].entries[1].minimumRoll == 3 &&
+              encounter.rollTables[1].entries.back().maximumRoll == 4,
+          "encounter tables preserve dice and result ranges");
+
+    Encounter reparsed;
+    error.clear();
+    Check(ParseEncounterBuilderFields(FormatEncounterCreatures(encounter),
+                                      FormatEncounterEffects(encounter),
+                                      FormatEncounterTables(encounter), reparsed, error) &&
+              reparsed.creatures.size() == 2 && reparsed.effects.size() == 3 &&
+              reparsed.rollTables.size() == 2,
+          "formatted encounter builder fields parse back into structured data");
+
+    error.clear();
+    Check(!ParseEncounterBuilderFields("", "", "Bad d6: 1-4=First; 4-6=Overlap",
+                                       reparsed, error) && !error.empty(),
+          "overlapping encounter-table ranges are rejected");
+    error.clear();
+    Check(ParseEncounterBuilderFields("", "A strange light appears", "", reparsed, error) &&
+              reparsed.creatures.empty() && reparsed.effects.size() == 1 &&
+              reparsed.rollTables.empty(),
+          "encounters can be noncombat single events without a roll table");
+}
+
+void TestEncounterRunner() {
+    Encounter encounter;
+    encounter.name = "Bridge Defense";
+    encounter.currentRound = 0;
+    encounter.activeParticipant = 0;
+    encounter.participants = {{"Scout", 18, 12, "", false},
+                              {"Ogre", 8, 30, "slowed", false},
+                              {"Mage", 14, 9, "concentrating", false}};
+
+    Check(campaign_tools::AdvanceTurn(encounter, 1) && encounter.activeParticipant == 1,
+          "encounter runner advances to the next participant");
+    Check(campaign_tools::AdvanceTurn(encounter, -1) && encounter.activeParticipant == 0,
+          "encounter runner moves to the previous participant");
+    Check(campaign_tools::AdvanceTurn(encounter, -1) && encounter.activeParticipant == 2,
+          "encounter runner wraps backward through initiative");
+    Check(campaign_tools::AdvanceTurn(encounter, 1) && encounter.activeParticipant == 0,
+          "encounter runner wraps forward through initiative");
+    Check(campaign_tools::AdjustActiveHitPoints(encounter, -3) &&
+              encounter.participants[0].currentHitPoints == 9,
+          "encounter runner applies damage to the active participant");
+    Check(campaign_tools::AdjustActiveHitPoints(encounter, 2) &&
+              encounter.participants[0].currentHitPoints == 11,
+          "encounter runner heals the active participant");
+    Check(campaign_tools::ToggleActiveDefeated(encounter) &&
+              encounter.participants[0].defeated,
+          "encounter runner toggles defeated state");
+    campaign_tools::AdvanceRound(encounter);
+    Check(encounter.currentRound == 1 && encounter.activeParticipant == 0,
+          "advancing a round normalizes round state and resets initiative position");
+
+    Encounter empty;
+    Check(!campaign_tools::AdvanceTurn(empty, 1) &&
+              !campaign_tools::AdjustActiveHitPoints(empty, 1) &&
+              !campaign_tools::ToggleActiveDefeated(empty),
+          "runner controls safely ignore encounters without participants");
+
+    EncounterRollTable table{"Weather", 6,
+                             {{1, 2, "Rain"}, {3, 5, "Cloud"}, {6, 6, "Clear"}}};
+    const EncounterTableEntry *low = campaign_tools::ResolveRoll(table, 1);
+    const EncounterTableEntry *high = campaign_tools::ResolveRoll(table, 6);
+    Check(low && low->result == "Rain" && high && high->result == "Clear",
+          "direct table rolls resolve boundary values");
+    Check(campaign_tools::ResolveRoll(table, 0) == nullptr &&
+              campaign_tools::ResolveRoll(table, 7) == nullptr,
+          "table rolls outside the die range do not resolve");
+    EncounterRollTable gap{"Gaps", 6, {{1, 2, "Low"}, {5, 6, "High"}}};
+    Check(campaign_tools::ResolveRoll(gap, 3) == nullptr,
+          "uncovered table rolls report no matching result");
+}
+
+void TestCreatureBuilderExtensions() {
+    CreatureStatBlock creature;
+    Check(creature.specialAbilities.empty(),
+          "new creatures begin with zero special abilities");
+    creature.specialAbilities.push_back({"Pack Tactics", "Advantage near an ally"});
+    creature.specialAbilities.push_back({"Keen Hearing", "Advantage on hearing checks"});
+    Check(creature.specialAbilities.size() == 2 &&
+              creature.specialAbilities[1].name == "Keen Hearing",
+          "creatures support any number of named abilities");
+
+    Check(campaign_tools::AbilityModifier(1) == -5 &&
+              campaign_tools::AbilityModifier(9) == -1 &&
+              campaign_tools::AbilityModifier(10) == 0 &&
+              campaign_tools::AbilityModifier(11) == 0 &&
+              campaign_tools::AbilityModifier(20) == 5,
+          "ability modifiers use tabletop floor division across score boundaries");
+
+    creature.damageVulnerabilities = "radiant";
+    creature.damageResistances = "cold; fire";
+    creature.damageImmunities = "poison";
+    creature.conditionImmunities = "charmed; poisoned";
+    creature.proficiencyBonus = "+4";
+    creature.passivePerception = "16";
+    creature.spellcasting = "Innate spellcasting";
+    creature.portraitFile = "tokens/frost_witch.png";
+    Check(!creature.damageResistances.empty() && !creature.spellcasting.empty() &&
+              creature.portraitFile.find(".png") != std::string::npos,
+          "expanded defenses, spellcasting, and token references are retained");
+}
+
+void TestMenuAndWorkflowActions() {
+    std::vector<float> vertices;
+    std::vector<UiHit> hits;
+    const UiAction actions[] = {UiAction::MainContinue, UiAction::SaveAs,
+                                UiAction::ReturnMainMenu, UiAction::ExportSheet,
+                                UiAction::EncounterLoadFile, UiAction::EncounterRun,
+                                UiAction::EncounterRollTable, UiAction::DungeonAddMarker,
+                                UiAction::DungeonAddEncounter};
+    for (std::size_t index = 0; index < std::size(actions); ++index)
+        ui_geometry::AppendButton(vertices, hits, 0.0f, static_cast<float>(index) * 24.0f,
+                                  120.0f, 22.0f, "ACTION", actions[index],
+                                  static_cast<int>(index), false);
+    Check(hits.size() == std::size(actions),
+          "new menu and workflow controls create hit targets");
+    for (std::size_t index = 0; index < std::size(actions); ++index)
+        Check(hits[index].action == actions[index] &&
+                  hits[index].value == static_cast<int>(index),
+              "new workflow hit targets preserve their action and value");
 }
 
 void TestToolCatalogue() {
@@ -370,6 +549,22 @@ void TestProjectRoundTrip() {
     source.pointsOfInterest.push_back(
         {4, 5, PoiKind::Dungeon, "Old Gate Crypt", "Three rooms beneath the ruined arch"});
     source.encounters.push_back({4, -3, "Goblin Ambush", "Six goblins attack from the ridge"});
+    source.encounters.back().creatures = {{6, "Goblin", "goblin.txt"}, {1, "Goblin Boss", ""}};
+    source.encounters.back().effects = {{"The scouts loose arrows"},
+                                        {"The boss charges on round two"}};
+    source.encounters.back().rollTables = {
+        {"Reinforcements", 6, {{1, 3, "No reinforcements"}, {4, 6, "Two goblins arrive"}}}};
+    source.encounters.back().trigger = "The party crosses the ridge";
+    source.encounters.back().objective = "Reach the watchtower";
+    source.encounters.back().environment = "Rocky highland road";
+    source.encounters.back().gameMasterNotes = "The boss retreats below half health";
+    source.encounters.back().rewards = "A silver map case";
+    source.encounters.back().successOutcome = "The watchtower is secured";
+    source.encounters.back().failureOutcome = "The warning beacon is lit";
+    source.encounters.back().sourceFile = "encounters/goblin_ambush.txt";
+    source.encounters.back().currentRound = 2;
+    source.encounters.back().activeParticipant = 0;
+    source.encounters.back().participants = {{"Goblin 1", 14, 5, "poisoned", false}};
     Dungeon dungeon;
     dungeon.worldCol = 4;
     dungeon.worldRow = 5;
@@ -387,6 +582,10 @@ void TestProjectRoundTrip() {
     dungeon.hasExit = true;
     dungeon.exitCol = 5;
     dungeon.exitRow = 2;
+    dungeon.markers.push_back({2, 1, DungeonMarkerKind::Treasure, "Hidden Cache",
+                               "Coins beneath a loose flagstone", "", true});
+    dungeon.markers.push_back({3, 1, DungeonMarkerKind::Encounter, "Crypt Guardians",
+                               "Skeletons rise", "encounters/crypt_guardians.txt", false});
     source.dungeons.push_back(std::move(dungeon));
     source.routes.push_back({RouteKind::River, "Bluewater", {{1.25, 2.5}, {3.75, 4.0}}});
 
@@ -425,8 +624,28 @@ void TestProjectRoundTrip() {
           "POI metadata, including dungeon markers, round-trips");
     Check(loaded.encounters.size() == 1 &&
               loaded.encounters[0].name == "Goblin Ambush" &&
-              loaded.encounters[0].description == "Six goblins attack from the ridge",
-          "encounter metadata round-trips");
+              loaded.encounters[0].description == "Six goblins attack from the ridge" &&
+              loaded.encounters[0].creatures.size() == 2 &&
+              loaded.encounters[0].creatures[0].sourceFile == "goblin.txt" &&
+              loaded.encounters[0].effects.size() == 2 &&
+              loaded.encounters[0].rollTables.size() == 1 &&
+              loaded.encounters[0].rollTables[0].entries.size() == 2 &&
+              loaded.encounters[0].trigger == "The party crosses the ridge" &&
+              loaded.encounters[0].objective == "Reach the watchtower" &&
+              loaded.encounters[0].environment == "Rocky highland road" &&
+              loaded.encounters[0].gameMasterNotes == "The boss retreats below half health" &&
+              loaded.encounters[0].rewards == "A silver map case" &&
+              loaded.encounters[0].successOutcome == "The watchtower is secured" &&
+              loaded.encounters[0].failureOutcome == "The warning beacon is lit" &&
+              loaded.encounters[0].sourceFile == "encounters/goblin_ambush.txt" &&
+              loaded.encounters[0].currentRound == 2 &&
+              loaded.encounters[0].activeParticipant == 0 &&
+              loaded.encounters[0].participants.size() == 1 &&
+              loaded.encounters[0].participants[0].initiative == 14 &&
+              loaded.encounters[0].participants[0].currentHitPoints == 5 &&
+              loaded.encounters[0].participants[0].conditions == "poisoned" &&
+              !loaded.encounters[0].participants[0].defeated,
+          "structured encounter content and run state round-trip");
     Check(loaded.dungeons.size() == 1 && loaded.dungeons[0].name == "Old Gate Crypt" &&
               loaded.dungeons[0].tiles.size() == 2 && loaded.dungeons[0].hasEntrance &&
               loaded.dungeons[0].entranceCol == 0 && loaded.dungeons[0].entranceRow == 0 &&
@@ -434,8 +653,14 @@ void TestProjectRoundTrip() {
               loaded.dungeons[0].exitRow == 2 && loaded.dungeons[0].terrainDefinitions.size() == 7 &&
               loaded.dungeons[0].terrainDefinitions[6].name == "Moss" &&
               loaded.dungeons[0].elevation.size() == 1 && loaded.dungeons[0].fog.size() == 1 &&
-              loaded.dungeons[0].sourceFile == "linked_crypt.txt",
-          "dungeon terrain, elevation, fog, file link, and special markers round-trip");
+              loaded.dungeons[0].sourceFile == "linked_crypt.txt" &&
+              loaded.dungeons[0].markers.size() == 2 &&
+              loaded.dungeons[0].markers[0].kind == DungeonMarkerKind::Treasure &&
+              loaded.dungeons[0].markers[0].gameMasterOnly &&
+              loaded.dungeons[0].markers[1].kind == DungeonMarkerKind::Encounter &&
+              !loaded.dungeons[0].markers[1].gameMasterOnly &&
+              loaded.dungeons[0].markers[1].sourceFile == "encounters/crypt_guardians.txt",
+          "dungeon terrain, elevation, fog, links, and content markers round-trip");
     Check(loaded.routes.size() == 1 && loaded.routes[0].kind == RouteKind::River &&
               loaded.routes[0].name == "Bluewater" && loaded.routes[0].points.size() == 2 &&
               loaded.routes[0].points[0].first == 1.25 && loaded.routes[0].points[1].second == 4.0,
@@ -447,6 +672,8 @@ void TestProjectRoundTrip() {
     standaloneDungeon.name = "Standalone Crypt";
     standaloneDungeon.tiles[grid_geometry::Pack(2, 3)] =
         static_cast<uint8_t>(DungeonTileKind::Floor);
+    standaloneDungeon.markers.push_back({2, 3, DungeonMarkerKind::Secret,
+                                         "False Wall", "Leads to the vault", "", true});
     standaloneSource.dungeons.push_back(std::move(standaloneDungeon));
     const std::filesystem::path standalonePath =
         std::filesystem::temp_directory_path() / "map_drawer_standalone_dungeon.txt";
@@ -457,12 +684,149 @@ void TestProjectRoundTrip() {
     Check(LoadProjectDocument(standalonePath.string(), standaloneLoaded, version, error) &&
               standaloneLoaded.standaloneDungeon && standaloneLoaded.dungeons.size() == 1 &&
               standaloneLoaded.pointsOfInterest.empty() &&
-              standaloneLoaded.dungeons[0].name == "Standalone Crypt",
+              standaloneLoaded.dungeons[0].name == "Standalone Crypt" &&
+              standaloneLoaded.dungeons[0].markers.size() == 1 &&
+              standaloneLoaded.dungeons[0].markers[0].kind == DungeonMarkerKind::Secret,
           "standalone dungeon identity and map round-trip without an overworld POI");
 
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
     std::filesystem::remove(standalonePath, ignored);
+
+    ProjectDocument encounterSource;
+    encounterSource.standaloneEncounter = true;
+    Encounter standaloneEncounter;
+    standaloneEncounter.name = "Falling Stars";
+    standaloneEncounter.effects = {{"A star strikes the old tower"}};
+    standaloneEncounter.trigger = "Midnight on the solstice";
+    standaloneEncounter.objective = "Contain the falling star";
+    standaloneEncounter.currentRound = 3;
+    standaloneEncounter.participants = {{"Star Spawn", 17, 22, "glowing", false}};
+    standaloneEncounter.rollTables = {
+        {"Impact", 4, {{1, 2, "Harmless sparks"}, {3, 4, "Arcane shockwave"}}}};
+    encounterSource.encounters.push_back(std::move(standaloneEncounter));
+    const std::filesystem::path encounterPath =
+        std::filesystem::temp_directory_path() / "map_drawer_standalone_encounter.txt";
+    error.clear();
+    Check(SaveProjectDocument(encounterPath.string(), encounterSource, error),
+          "standalone encounter document saves");
+    ProjectDocument encounterLoaded;
+    Check(LoadProjectDocument(encounterPath.string(), encounterLoaded, version, error) &&
+              encounterLoaded.standaloneEncounter && encounterLoaded.encounters.size() == 1 &&
+              encounterLoaded.encounters[0].name == "Falling Stars" &&
+              encounterLoaded.encounters[0].rollTables.size() == 1 &&
+              encounterLoaded.encounters[0].trigger == "Midnight on the solstice" &&
+              encounterLoaded.encounters[0].objective == "Contain the falling star" &&
+              encounterLoaded.encounters[0].currentRound == 3 &&
+              encounterLoaded.encounters[0].participants.size() == 1 &&
+              encounterLoaded.encounters[0].participants[0].name == "Star Spawn",
+          "standalone encounter identity, builder data, and run state round-trip");
+    std::filesystem::remove(encounterPath, ignored);
+
+    ProjectDocument creatureSource;
+    creatureSource.standaloneCreature = true;
+    CreatureStatBlock creature;
+    creature.name = "Ash Drake";
+    creature.classification = "Large dragon, neutral";
+    creature.armorClass = "17 (natural armor)";
+    creature.hitPoints = "95 (10d10+40)";
+    creature.speed = "40 ft., fly 80 ft.";
+    creature.abilityScores = {19, 14, 18, 8, 13, 12};
+    creature.challenge = "6";
+    creature.traits = "Heated Body: adjacent creatures take fire damage";
+    creature.specialAbilities = {
+        {"Ash Step", "Teleport up to 30 feet through smoke"},
+        {"Cinder Sight", "See normally through magical smoke"}};
+    creature.actions = "Bite: +7 to hit; Ash Breath: recharge 5-6";
+    creature.reactions = "Tail Deflection: add 2 AC against one attack";
+    creature.legendaryActions = "Wingbeat: move half speed without opportunity attacks";
+    creature.damageResistances = "fire";
+    creature.damageVulnerabilities = "cold";
+    creature.damageImmunities = "poison";
+    creature.conditionImmunities = "frightened";
+    creature.proficiencyBonus = "+3";
+    creature.passivePerception = "14";
+    creature.spellcasting = "Innate: produce flame at will";
+    creature.portraitFile = "tokens/ash_drake.png";
+    creatureSource.creatures.push_back(std::move(creature));
+    const std::filesystem::path creaturePath =
+        std::filesystem::temp_directory_path() / "map_drawer_creature.txt";
+    error.clear();
+    Check(SaveProjectDocument(creaturePath.string(), creatureSource, error),
+          "standalone creature stat block saves");
+    ProjectDocument creatureLoaded;
+    Check(LoadProjectDocument(creaturePath.string(), creatureLoaded, version, error) &&
+              creatureLoaded.standaloneCreature && creatureLoaded.creatures.size() == 1 &&
+              creatureLoaded.creatures[0].name == "Ash Drake" &&
+              creatureLoaded.creatures[0].armorClass == "17 (natural armor)" &&
+              creatureLoaded.creatures[0].abilityScores[0] == 19 &&
+              creatureLoaded.creatures[0].abilityScores[5] == 12 &&
+              creatureLoaded.creatures[0].actions.find("Ash Breath") != std::string::npos &&
+              creatureLoaded.creatures[0].specialAbilities.size() == 2 &&
+              creatureLoaded.creatures[0].specialAbilities[1].name == "Cinder Sight" &&
+              creatureLoaded.creatures[0].reactions.find("Tail Deflection") != std::string::npos &&
+              creatureLoaded.creatures[0].legendaryActions.find("Wingbeat") != std::string::npos &&
+              creatureLoaded.creatures[0].damageVulnerabilities == "cold" &&
+              creatureLoaded.creatures[0].damageResistances == "fire" &&
+              creatureLoaded.creatures[0].damageImmunities == "poison" &&
+              creatureLoaded.creatures[0].conditionImmunities == "frightened" &&
+              creatureLoaded.creatures[0].proficiencyBonus == "+3" &&
+              creatureLoaded.creatures[0].passivePerception == "14" &&
+              creatureLoaded.creatures[0].spellcasting.find("produce flame") != std::string::npos &&
+              creatureLoaded.creatures[0].portraitFile == "tokens/ash_drake.png",
+          "standalone creature identity and complete stat block round-trip");
+    std::filesystem::remove(creaturePath, ignored);
+}
+
+void TestVersionFourteenProjectCompatibility() {
+    ProjectDocument source;
+    Encounter encounter;
+    encounter.name = "Old Encounter";
+    encounter.trigger = "Version fifteen only";
+    source.encounters.push_back(encounter);
+    CreatureStatBlock creature;
+    creature.name = "Old Creature";
+    creature.damageResistances = "fire";
+    source.creatures.push_back(creature);
+    Dungeon dungeon;
+    dungeon.name = "Old Dungeon";
+    source.dungeons.push_back(dungeon);
+
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "map_drawer_version_14.txt";
+    std::string error;
+    Check(SaveProjectDocument(path.string(), source, error),
+          "version-fourteen compatibility fixture saves in the current format");
+    std::ifstream input(path);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.rfind("ENCOUNTER_DETAILS ", 0) == 0 ||
+            line.rfind("ENCOUNTER_RUN ", 0) == 0 ||
+            line.rfind("CREATURE_DETAILS ", 0) == 0 ||
+            line.rfind("DUNGEON_MARKERS ", 0) == 0)
+            continue;
+        lines.push_back(line);
+    }
+    input.close();
+    lines[0] = "MAP_DRAWER_PROJECT 14";
+    std::ofstream output(path, std::ios::trunc);
+    for (const std::string &savedLine : lines) output << savedLine << '\n';
+    output.close();
+
+    ProjectDocument loaded;
+    int version = 0;
+    error.clear();
+    Check(LoadProjectDocument(path.string(), loaded, version, error),
+          "version-fourteen projects remain loadable without new sections");
+    Check(version == 14 && loaded.encounters.size() == 1 &&
+              loaded.encounters[0].name == "Old Encounter" &&
+              loaded.encounters[0].trigger.empty() && loaded.creatures.size() == 1 &&
+              loaded.creatures[0].damageResistances.empty() && loaded.dungeons.size() == 1 &&
+              loaded.dungeons[0].markers.empty(),
+          "version-fourteen files receive safe defaults for version-fifteen features");
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
 }
 
 void TestVersionThreeProjectCompatibility() {
@@ -516,6 +880,7 @@ void TestDungeonPoiMigration() {
         bool skippingDungeonLayers = false;
         while (std::getline(input, line)) {
             if (line.rfind("DOCUMENT ", 0) == 0) continue;
+            if (line.rfind("CREATURES ", 0) == 0) continue;
             if (line.rfind("DUNGEON_TERRAINS ", 0) == 0) {
                 skippingDungeonLayers = true;
                 continue;
@@ -587,6 +952,61 @@ void TestProjectValidation() {
     Check(!LoadProjectDocument(path.string(), loaded, version, error),
           "malformed project headers are rejected");
 
+    ProjectDocument versionFifteen;
+    Encounter encounter;
+    encounter.name = "Validation Encounter";
+    encounter.currentRound = 1;
+    encounter.participants = {{"Scout", 10, 5, "", false}};
+    versionFifteen.encounters.push_back(encounter);
+    CreatureStatBlock creature;
+    creature.name = "Validation Creature";
+    versionFifteen.creatures.push_back(creature);
+    Dungeon dungeon;
+    dungeon.name = "Validation Dungeon";
+    dungeon.markers.push_back({0, 0, DungeonMarkerKind::Note, "Note", "Text", "", true});
+    versionFifteen.dungeons.push_back(dungeon);
+
+    error.clear();
+    Check(SaveProjectDocument(path.string(), versionFifteen, error),
+          "version-fifteen validation fixture saves");
+    Check(ReplaceFirstInFile(path, "ENCOUNTER_RUN 1 0 1", "ENCOUNTER_RUN 1 3 1"),
+          "encounter run fixture can be corrupted");
+    error.clear();
+    Check(!LoadProjectDocument(path.string(), loaded, version, error) &&
+              error == "encounter active participant is out of range",
+          "out-of-range active encounter participants are rejected");
+
+    error.clear();
+    Check(SaveProjectDocument(path.string(), versionFifteen, error),
+          "version-fifteen fixture resets after run-state validation");
+    Check(ReplaceFirstInFile(path, "10 5 0 \"Scout\"", "10 5 2 \"Scout\""),
+          "participant fixture can be corrupted");
+    error.clear();
+    Check(!LoadProjectDocument(path.string(), loaded, version, error) &&
+              error == "invalid encounter participant",
+          "invalid defeated-state values are rejected");
+
+    error.clear();
+    Check(SaveProjectDocument(path.string(), versionFifteen, error),
+          "version-fifteen fixture resets after participant validation");
+    Check(ReplaceFirstInFile(path, "0 0 7 1 \"Note\"",
+                            "0 0 99 1 \"Note\""),
+          "dungeon marker fixture can be corrupted");
+    error.clear();
+    Check(!LoadProjectDocument(path.string(), loaded, version, error) &&
+              error == "invalid dungeon marker",
+          "unknown dungeon marker kinds are rejected");
+
+    error.clear();
+    Check(SaveProjectDocument(path.string(), versionFifteen, error),
+          "version-fifteen fixture resets after marker validation");
+    Check(ReplaceFirstInFile(path, "CREATURE_DETAILS ", "BROKEN_CREATURE_DETAILS "),
+          "creature details fixture can be corrupted");
+    error.clear();
+    Check(!LoadProjectDocument(path.string(), loaded, version, error) &&
+              error == "invalid CREATURE_DETAILS section",
+          "missing version-fifteen creature details are rejected");
+
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
 }
@@ -614,18 +1034,23 @@ const FeatureTest kFeatureTests[] = {
     {"markers", "cities, POIs, encounters, and POI visuals", TestMarkerFeatures},
     {"routes", "river and trade-route metadata and appearance", TestRouteFeature},
     {"dungeons", "dungeon palettes, layers, and world isolation", TestDungeonFeature},
+    {"encounters", "noncombat events, creatures, effect chains, and roll tables", TestEncounterBuilder},
+    {"runner", "turns, rounds, hit points, defeated state, and table rolls", TestEncounterRunner},
+    {"creatures", "abilities, modifiers, defenses, spells, and token references", TestCreatureBuilderExtensions},
+    {"workflows", "main-menu, linking, export, run, and marker UI actions", TestMenuAndWorkflowActions},
     {"tools", "complete editor tool catalogue", TestToolCatalogue},
     {"commands", "generic world/dungeon layer commands", TestEditorLayerCommands},
     {"history", "stroke recording, undo, redo, and reset", TestEditorHistory},
     {"state", "dirty state, scene revision, and search invalidation", TestEditorStateLifecycle},
     {"presentation", "UI hits, glyphs, tiles, markers, routes, and labels", TestPresentationGeometry},
-    {"persistence", "version-eight full-feature save/load round trip", TestProjectRoundTrip},
-    {"compatibility", "older project loading and dungeon-POI migration", nullptr},
+    {"persistence", "version-fifteen full-feature save/load round trip", TestProjectRoundTrip},
+    {"compatibility", "v14/v3 loading, safe defaults, and dungeon-POI migration", nullptr},
     {"validation", "invalid and unsupported project rejection", TestProjectValidation},
     {"lookups", "domain labels and tiny-font lookup", TestDomainLookups},
 };
 
 void RunCompatibilityTests() {
+    TestVersionFourteenProjectCompatibility();
     TestVersionThreeProjectCompatibility();
     TestDungeonPoiMigration();
 }
@@ -818,14 +1243,20 @@ bool ShowResultsWindow(std::vector<FeatureResult> &results) {
                                       : Vec3{0.95f, 0.72f, 0.24f};
         ui_geometry::AppendText(vertices, summary, 28.0f, 62.0f, 2.0f, summaryColor);
 
-        float y = 100.0f;
-        const float listWidth = std::min(710.0f, static_cast<float>(width) * 0.60f);
+        const float listWidth = std::min(760.0f, static_cast<float>(width) * 0.62f);
+        const float columnGap = 8.0f;
+        const float columnWidth = (listWidth - columnGap) * 0.5f;
+        const std::size_t rowsPerColumn = (results.size() + 1) / 2;
         for (std::size_t index = 0; index < results.size(); ++index) {
             const FeatureResult &result = results[index];
+            const std::size_t column = index / rowsPerColumn;
+            const std::size_t row = index % rowsPerColumn;
+            const float x = 24.0f + static_cast<float>(column) * (columnWidth + columnGap);
+            const float y = 100.0f + static_cast<float>(row) * 42.0f;
             const Vec3 rowColor = index % 2 == 0 ? Vec3{0.085f, 0.10f, 0.13f}
                                                   : Vec3{0.065f, 0.078f, 0.105f};
-            ui_geometry::AppendRect(vertices, 24.0f, y - 6.0f,
-                                    listWidth, 30.0f, rowColor);
+            ui_geometry::AppendRect(vertices, x, y - 6.0f,
+                                    columnWidth, 36.0f, rowColor);
             const char *statusText = "WAIT";
             Vec3 statusColor{0.22f, 0.25f, 0.31f};
             if (result.status == FeatureResult::Status::Running) {
@@ -838,15 +1269,14 @@ bool ShowResultsWindow(std::vector<FeatureResult> &results) {
                 statusText = "FAIL";
                 statusColor = {0.58f, 0.12f, 0.10f};
             }
-            ui_geometry::AppendRect(vertices, 36.0f, y, 62.0f, 18.0f,
+            ui_geometry::AppendRect(vertices, x + 10.0f, y, 54.0f, 18.0f,
                                     statusColor);
             ui_geometry::AppendText(vertices, statusText,
-                                    45.0f, y + 4.0f, 1.5f, {1.0f, 1.0f, 1.0f});
-            ui_geometry::AppendText(vertices, result.name, 116.0f, y + 2.0f, 2.0f,
-                                    {0.88f, 0.91f, 0.98f}, 18);
-            ui_geometry::AppendText(vertices, result.description, 290.0f, y + 4.0f, 1.15f,
-                                    {0.67f, 0.72f, 0.80f}, 49);
-            y += 32.0f;
+                                    x + 17.0f, y + 4.0f, 1.4f, {1.0f, 1.0f, 1.0f});
+            ui_geometry::AppendText(vertices, result.name, x + 76.0f, y, 1.7f,
+                                    {0.88f, 0.91f, 0.98f}, 20);
+            ui_geometry::AppendText(vertices, result.description, x + 76.0f, y + 19.0f, 1.0f,
+                                    {0.67f, 0.72f, 0.80f}, 38);
         }
         AppendVisualPreview(vertices, listWidth + 48.0f,
                             static_cast<float>(width) - listWidth - 72.0f, now);
